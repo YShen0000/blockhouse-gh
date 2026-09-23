@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Firms List - Performance Reports</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Buduj+Sans+TRIAL:wght@400;700&family=IBM+Plex+Mono:wght@300;400;600&display=swap');
+
+        body {
+            background-color: #FFFFFF;
+            color: #101010;
+            font-family: 'IBM Plex Mono', monospace;
+            line-height: 1.6;
+            margin: 0;
+            padding: 0;
+        }
+
+        .container {
+            width: 80%;
+            margin: 40px auto;
+            max-width: 1200px;
+            text-align: center;
+        }
+
+        h1 {
+            color: #101010;
+            font-family: 'Buduj Sans TRIAL', sans-serif;
+            font-weight: 700;
+            margin-bottom: 20px;
+            letter-spacing: 1px;
+            font-size: 2.5em;
+        }
+
+        ul {
+            list-style-type: none;
+            padding: 0;
+        }
+
+        li {
+            margin: 10px 0;
+        }
+
+        a {
+            color: #7962E7;
+            text-decoration: none;
+            font-size: 1.2em;
+        }
+
+        a:hover {
+            color: #3DBEF6;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Firms List - Performance Reports</h1>
+        <ul>
+            {{ firm_links|safe }}
+        </ul>
+    </div>
+</body>
+</html>

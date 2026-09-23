@@ -1,0 +1,1458 @@
+import boto3
+from io import StringIO
+import logging
+import json
+import pandas as pd
+import csv
+
+from django.conf import settings
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.core.cache import cache
+
+from Analytics.models import Uploads, Trade, UploadHoodWinked, UploadBlockhouse
+from Analytics.Engine.DataProcessing import DataCleaning
+from Analytics.utils.timestamp_converter import convert_to_datetime
+
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.decorators import api_view, permission_classes
+
+from datetime import datetime, timedelta
+from Analytics.utils import reportCalculation, testreports, word_report
+from Analytics.utils import data_fetching_and_preprocessing
+from decimal import Decimal
+import numpy as np
+from io import BytesIO
+import base64
+
+logger = logging.getLogger(__name__)
+
+@csrf_exempt
+@api_view(['POST'])
+# @permission_classes([IsAuthenticated])
+def hoodwinked_upload_file(request):
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Invalid request'}, status=400)
+    user_email = request.POST.get('user_email')
+    platform = request.POST.get('platform')
+    print("user_email", user_email)
+    print("platform", platform)
+    files = request.FILES.getlist('files')  # Get multiple files
+
+
+    if not files:
+        return JsonResponse({'error': 'No files provided'}, status=400)
+
+    if user_email != 'demo':
+        # Read the file through dataFrame
+        file_df = pd.read_csv(files[0])
+
+        # Check the unique columns
+        unique_column=''
+        if platform == 'Charles Schwab':
+            unique_column = 'Fees and Comm'
+        elif platform == 'Robinhood':
+            unique_column = 'Trans Code'
+        elif platform == 'Webull':
+            unique_column = 'Filled Time'
+        
+        # if unique_column not in file_df.columns:
+        #     return JsonResponse({'error': 'Apologies, it seems like the platform you have specified is incorrect, or the data has been manipulated. Please try re-uploading the original file again and specify the correct platform.'}, status=400)
+
+        # Data Cleaning
+        cleaned_data = dataCleaning(file_df, platform)
+
+        # Check if the 'Activity Date' column exists
+        # if 'Activity Date' not in cleaned_data.columns:
+        #     return JsonResponse({'error': "Column 'Activity Date' not found in the file"}, status=400)
+        
+        # Convert 'Activity Date' to datetime
+        # cleaned_data['Activity Date'] = pd.to_datetime(cleaned_data['Activity Date'], errors='coerce')
+        
+        # Check if there are any equity trades in the last 2 years
+        # two_years_ago = datetime.now() - timedelta(days=2*365)
+        # recent_trades = cleaned_data[cleaned_data['Activity Date'] >= two_years_ago]
+        # print("recent_trades", recent_trades)
+        
+        # if recent_trades.empty:
+        #     return JsonResponse({'error': "No trades within the last 2 years"}, status=400)
+        
+        # equity_trades = recent_trades[recent_trades['Trans Code'].str.contains('buy|sell', case=False, regex=True)]
+        
+        # if equity_trades.empty:
+        #     return JsonResponse({'error': "No equity trades within the last 2 years"}, status=400)
+        
+    
+    # Data Uploading
+    s3 = boto3.client('s3',
+                      aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                      aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                      region_name=settings.AWS_REGION)
+
+    responses = []
+
+    for file in files:
+        try:
+            # user_folder = str(user_email)  # or use request.user.username
+            user_folder = f"hoodwinked/app/{user_email}"
+
+            # Add a timestamp to the file name to make it unique
+            timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+            s3_file_name = f"{timestamp}_{file.name}"
+            s3_file_path = f"{user_folder}/{s3_file_name}"
+
+            # Convert DataFrame to CSV
+            if user_email == 'demo':
+                s3.upload_fileobj(file, settings.AWS_STORAGE_BUCKET, s3_file_path)
+            else:
+                csv_buffer = StringIO()
+                cleaned_data.to_csv(csv_buffer, index=False)
+                # s3.upload_fileobj(cleaned_data, settings.AWS_STORAGE_BUCKET, s3_file_path)
+                s3.put_object(Bucket=settings.AWS_STORAGE_BUCKET, Key=s3_file_path, Body=csv_buffer.getvalue())
+
+            upload_record = UploadHoodWinked.objects.create(
+                user_email=user_email,
+                file_name=s3_file_name,
+                file_size=file.size,
+                file_path=f"https://analyticsv1.s3.amazonaws.com/{s3_file_path}",
+                platform=platform
+            )
+
+            # trades_list = [
+            #     Trade(
+            #         file=upload_record,
+            #         cusip=row['CUSIP'],
+            #         trade_timestamp=convert_to_datetime(
+            #             row['Trade Date'], row['Trade Time']),
+            #         trade_size=int(row['Trade Size']),
+            #         face_value=int(row['Face Value']),
+            #         asset_inventory=int(row['Asset Inventory']),
+            #         fill=row['Fill'],
+            #         execution_time=int(row['Execution Time']),
+            #         trade_price=float(row['Trade Price']),
+            #         trade_direction=row['Trade Direction'].upper(),
+            #         counterparty=row['Counterparty'],
+            #         trader=row['Trader']
+            #     ) for index, row in df.iterrows()
+            # ]
+
+            # Trade.objects.bulk_create(trades_list)
+
+            responses.append(
+                {'message': f'File {file.name} uploaded successfully'})
+        except Exception as e:
+            logger.error(
+                f"Error uploading file {file.name} to S3: {str(e)}", exc_info=True)
+            responses.append({'error': str(e), 'file': file.name})
+
+    return JsonResponse({'responses': responses})
+
+
+def dataCleaning(df, platform):
+    def preprocess_by_platform(trade_blotter, platform_type):
+        if platform_type == 'Robinhood':
+            return process_robinhood(trade_blotter)
+        elif platform_type == 'Charles Schwab':
+            return process_cs(trade_blotter)
+        elif platform_type == 'Webull':
+            return process_webull(trade_blotter)
+        else:
+            return 'Error'
+        
+    def process_cs(trade_blotter):
+        
+        trade_blotter.rename(columns={
+        'Date': 'Activity Date',
+        'Action': 'Trans Code',
+        'Symbol': 'Instrument'
+        }, inplace=True)
+        
+        trade_blotter.dropna(subset=['Activity Date', 'Trans Code', 'Instrument'], inplace=True)
+        trade_blotter_filtered = trade_blotter[trade_blotter['Trans Code'].str.contains('buy|sell', case=False, regex=True)]
+        
+        return trade_blotter_filtered
+
+    def process_robinhood(trade_blotter):
+        
+        trade_blotter.dropna(subset=['Activity Date', 'Trans Code', 'Instrument'], inplace=True)
+        trade_blotter_filtered = trade_blotter[trade_blotter['Trans Code'].str.contains('buy|sell', case=False, regex=True)]
+        
+        return trade_blotter_filtered
+
+    def process_webull(trade_blotter):
+        trade_blotter.rename(columns={
+        'Date': 'Activity Date',
+        'Action': 'Trans Code',
+        'Symbol': 'Instrument'
+        }, inplace=True)
+        trade_blotter.dropna(subset=['Activity Date', 'Trans Code', 'Instrument'], inplace=True)
+        trade_blotter_filtered = trade_blotter[trade_blotter['Trans Code'].str.contains('buy|sell', case=False, regex=True)]
+        
+        return trade_blotter_filtered
+    
+    processed_df = preprocess_by_platform(df, platform)
+    return processed_df
+
+
+
+@csrf_exempt
+@api_view(['GET'])
+# @permission_classes([IsAuthenticated])
+def hoodwinked_files_list(request):
+    try:
+        user_email = request.query_params.get('user_email')
+        print("user_email", user_email)
+
+        uploads = UploadHoodWinked.objects.filter(user_email=user_email).values()
+        return JsonResponse({'uploads': list(uploads)})
+
+    except Exception as e:
+        logger.error(f"Error fetching files: {str(e)}", exc_info=True)
+        return JsonResponse({'error': str(e)}, status=500)
+    
+
+
+@csrf_exempt
+def hoodwinked_delete_file(request):
+    if request.method == 'POST':
+
+        try:
+            # Check if the request body is empty
+            if not request.body:
+                return JsonResponse({'error': 'Empty request body'}, status=400)
+            
+            # Handle JSON parsing errors
+            try:
+                data = json.loads(request.body)
+            except json.JSONDecodeError as e:
+                    return JsonResponse({'error': f'Invalid JSON: {str(e)}'}, status=400)
+            file_id = data.get('file_id')
+
+            if not file_id:
+                return JsonResponse({'error': 'No file ID provided'}, status=400)
+
+            upload = UploadHoodWinked.objects.get(id=file_id)
+
+            # Trade.objects.filter(file=upload).delete()
+
+            s3 = boto3.client('s3',
+                              aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                              aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                              region_name=settings.AWS_REGION)
+            
+            filtered_path = upload.file_path.replace('https://analyticsv1.s3.amazonaws.com/', '')
+            s3.delete_object(Bucket=settings.AWS_STORAGE_BUCKET,
+                             Key=filtered_path)
+
+            upload.delete()
+
+            return JsonResponse({'message': 'File deleted successfully'})
+
+        except Exception as e:
+            logger.error(
+                f"Error deleting file from S3: {str(e)}", exc_info=True)
+            return JsonResponse({'error': str(e)}, status=500)
+    else:
+        return JsonResponse({'error': 'Invalid request method'}, status=405)
+
+@csrf_exempt
+def blockhouse_delete_file(request):
+    if request.method == 'POST':
+
+        try:
+            # Check if the request body is empty
+            if not request.body:
+                return JsonResponse({'error': 'Empty request body'}, status=400)
+            
+            # Handle JSON parsing errors
+            try:
+                data = json.loads(request.body)
+            except json.JSONDecodeError as e:
+                    return JsonResponse({'error': f'Invalid JSON: {str(e)}'}, status=400)
+            file_id = data.get('file_id')
+
+            if not file_id:
+                return JsonResponse({'error': 'No file ID provided'}, status=400)
+
+            upload = UploadBlockhouse.objects.get(id=file_id)
+
+            # Trade.objects.filter(file=upload).delete()
+
+            s3 = boto3.client('s3',
+                              aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                              aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                              region_name=settings.AWS_REGION)
+            
+            filtered_path = upload.file_path.replace('https://analyticsv1.s3.amazonaws.com/', '')
+            s3.delete_object(Bucket=settings.AWS_STORAGE_BUCKET,
+                             Key=filtered_path)
+
+            upload.delete()
+
+            return JsonResponse({'message': 'File deleted successfully'})
+
+        except Exception as e:
+            logger.error(
+                f"Error deleting file from S3: {str(e)}", exc_info=True)
+            return JsonResponse({'error': str(e)}, status=500)
+    else:
+        return JsonResponse({'error': 'Invalid request method'}, status=405)
+
+@api_view(['GET'])
+# @permission_classes([IsAuthenticated])
+def hoodwinked_generate_report(request):
+    try:
+        file_id = request.query_params.get('file_id')
+        platform = request.query_params.get('platform')
+        site = request.query_params.get('site')
+        siteType = request.query_params.get('siteType')
+        # upload = UploadHoodWinked.objects.get(id=file_id)
+
+        # s3 = boto3.client('s3',
+        #                     aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        #                     aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        #                     region_name=settings.AWS_REGION)
+
+        # # s3.delete_object(Bucket=settings.AWS_STORAGE_BUCKET,
+        # #                     Key=upload.file_name)
+
+        # user_folder = str(upload.user_email)  # or use request.user.username
+        # s3_file_path = f"{user_folder}/{upload.file_name}"
+
+        # obj = s3.get_object(
+        #         Bucket=settings.AWS_STORAGE_BUCKET, Key=s3_file_path)
+        
+        # file_content = obj['Body'].read().decode('utf-8')
+
+        # df = pd.read_csv(StringIO(file_content))
+        cache_key = f"{platform}_{file_id}"
+        df = cache.get(key=cache_key)
+        #print(df)
+        if df is None:
+            print('Not in Cache')
+            df = fetch_file_from_s3(file_id, site, siteType)
+            cache.set(key=cache_key, value=df, timeout=60*15)
+        else:
+            print('In Cache')
+            df = cache.get(key=cache_key)
+        
+        #df = fetch_file_from_s3(file_id)
+
+        
+
+        # Report Calculation
+        report_calculation = reportCalculation.main(df, platform,file_id)
+
+        # Generate Report
+        return word_report.generate_report(report_calculation)
+
+    except Exception as e:
+        logger.error(f"Error fetching files: {str(e)}", exc_info=True)
+        return JsonResponse({'error': str(e)}, status=500)
+
+@api_view(['GET'])
+def hoodwinked_generate_report_plaid(request):
+    try:
+        platform = request.query_params.get('platform')
+        email = request.query_params.get('email')
+        
+        file_id = email
+        cache_key = f"{platform}_{file_id}"
+        df = cache.get(key=cache_key)
+        #print(df)
+        if df is None:
+            print('Not in Cache')
+            #df = fetch_file_from_s3(file_id)
+            df = fetch_latest_file_from_s3(email)
+            cache.set(key=cache_key, value=df, timeout=60*15)
+        else:
+            print('In Cache')
+            df = cache.get(key=cache_key)
+        
+        # Report Calculation
+        report_calculation = reportCalculation.main(df, platform,file_id)
+
+        # Generate Report
+        document_base64 = testreports.generate_report(report_calculation)
+        # return JsonResponse({'document': document_base64, 'message': 'Report generation successful'})
+        return document_base64
+
+        # return JsonResponse({'uploads': "successful"})
+
+    except Exception as e:
+        logger.error(f"Error fetching files: {str(e)}", exc_info=True)
+        return JsonResponse({'error': str(e)}, status=500)
+
+
+def count_trades(df):
+    return df[df['type'].isin(['buy', 'sell'])].shape[0]
+
+def get_plaid_aum(df):
+
+    try:
+        # starting_aum = Decimal('0')  
+        net_cash_flow = Decimal('0')
+        net_investment_returns = Decimal('0')
+        total_fees = Decimal('0')
+
+
+        for _, row in df.iterrows():
+            amount = Decimal(str(row['amount']))
+            transaction_type = row['type']
+            subtype = row['subtype']
+            name = row['name'].upper()
+
+
+            if transaction_type == 'transfer':
+                if 'DEPOSIT' in name or 'ACH DEPOSIT' in name:
+                    net_cash_flow += abs(amount)
+                elif 'WITHDRAWL' in name or 'ACH WITHDRAWAL' in name:
+                    net_cash_flow -= abs(amount)
+            elif transaction_type == 'cash':
+                if subtype == 'dividend':
+                    net_investment_returns += abs(amount)
+            elif transaction_type == 'fee':
+                total_fees += abs(amount)
+
+        aum = net_cash_flow + net_investment_returns - total_fees        
+        trade_count = count_trades(df)
+
+        return {
+            'aum': float(aum),
+            'total_trades': trade_count,
+        }
+
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
+
+# Helper function to convert non-serializable objects to JSON serializable
+def convert_to_serializable(data):
+    if isinstance(data, np.ndarray):
+        return data.tolist()
+    elif isinstance(data, BytesIO):
+        return base64.b64encode(data.getvalue()).decode('utf-8')
+    elif isinstance(data, pd.DataFrame):
+        return data.to_dict(orient='records')
+    elif isinstance(data, dict):
+        return {key: convert_to_serializable(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [convert_to_serializable(item) for item in data]
+    elif isinstance(data, (int, float, str, bool, type(None))):
+        return data
+    else:
+        logger.warning(f"Unhandled type in convert_to_serializable: {type(data)}")
+        return str(data) 
+
+
+@api_view(['GET'])
+def hoodwinked_onboard_plaid_data(request):
+    try:
+        platform = request.query_params.get('platform')
+        email = request.query_params.get('email')
+        cache_key = f"{platform}_{email}"
+        
+        df = cache.get(cache_key)
+        if df is None:
+            print('Not in Cache')
+            df = fetch_latest_file_from_s3(email)
+            cache.set(cache_key, df, timeout=60*15)
+        else:
+            print('In Cache')
+        
+        report_calculation = reportCalculation.main(df, platform, email)
+        plaid_aum_data = get_plaid_aum(df)
+        report_calculation['plaid_aum'] = plaid_aum_data
+        
+        serializable_data = convert_to_serializable(report_calculation)
+        
+        return JsonResponse({
+            'data': serializable_data,
+            'message': 'Report generation successful'
+        })
+    # except ValueError as e:
+    #     logger.error(f"Error in Plaid AUM calaculation: {str(e)}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Error in hoodwinked_onboard_plaid_data: {str(e)}", exc_info=True)
+        return JsonResponse({'error': str(e)}, status=500)
+    
+
+@api_view(['GET'])
+# @permission_classes([IsAuthenticated])
+def hoodwinked_analyze(request):
+    print('In Hoodwinked Analyze')
+    try:
+        file_id = request.query_params.get('file_id')
+        platform = request.query_params.get('platform')
+        
+        # upload = UploadHoodWinked.objects.get(id=file_id)
+
+        # s3 = boto3.client('s3',
+        #                     aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        #                     aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        #                     region_name=settings.AWS_REGION)
+
+        # # s3.delete_object(Bucket=settings.AWS_STORAGE_BUCKET,
+        # #                     Key=upload.file_name)
+
+        # user_folder = str(upload.user_email)  # or use request.user.username
+        # s3_file_path = f"{user_folder}/{upload.file_name}"
+
+        # obj = s3.get_object(
+        #         Bucket=settings.AWS_STORAGE_BUCKET, Key=s3_file_path)
+        
+        # file_content = obj['Body'].read().decode('utf-8')
+
+        # df = pd.read_csv(StringIO(file_content))
+
+        # # data_fetching_and_preprocessing
+        # trade_blotter = data_fetching_and_preprocessing.preprocess_by_platform(df, platform)
+    
+        # # Fetch market data
+        # tickers = trade_blotter['Instrument'].unique()
+        # data_dict = data_fetching_and_preprocessing.fetch_market_data(tickers)
+        # trade_blotter = data_fetching_and_preprocessing.preprocess_data(trade_blotter, data_dict)
+
+        # trade_blotter_filtered = trade_blotter.copy()  # Create a filtered copy if needed
+        
+        cache_key = f"{platform}_{file_id}"
+        df = cache.get(key=cache_key)
+        trade_blotter = cache.get(key=f"{platform}_{file_id}_trade_blotter")
+        scaling_factor_report = cache.get(key=f"{platform}_{file_id}_scaling_factor")
+        #print(df)
+        if df is None or trade_blotter is None or scaling_factor_report is None: 
+            print('Not in Cache')
+            df= fetch_file_from_s3(file_id)
+            cache.set(key=cache_key, value=df, timeout=60*15)
+            trade_blotter, tickers, data_dict = preprocess_data_merged(df, platform)
+            cache.set(key=f"{platform}_{file_id}_trade_blotter", value=trade_blotter, timeout=60*15)
+            trade_blotter_filtered = trade_blotter.copy()
+            cache.set(key=f"{platform}_{file_id}_tickers", value=tickers, timeout=60*15)
+            cache.set(key=f"{platform}_{file_id}_data_dict", value=data_dict, timeout=60*15)
+            scaling_factor_report = reportCalculation.calculate_potential_savings(trade_blotter)['scaling_factor']
+            cache.set(key=f"{platform}_{file_id}_scaling_factor", value=scaling_factor_report, timeout=60*15)
+            
+            ##Set cache for report calculation
+            #reportCalculation.main(df, platform)
+        else:
+            print('In Cache')
+            df = cache.get(key=cache_key)
+            trade_blotter = cache.get(key=f"{platform}_{file_id}_trade_blotter")
+            tickers = cache.get(key=f"{platform}_{file_id}_tickers")
+            data_dict = cache.get(key=f"{platform}_{file_id}_data_dict")
+            scaling_factor_report = cache.get(key=f"{platform}_{file_id}_scaling_factor")
+            trade_blotter_filtered = trade_blotter.copy()
+            
+
+
+        #scaling_factor_report = reportCalculation.calculate_potential_savings(trade_blotter)['scaling_factor']
+        
+        # df = fetch_file_from_s3(file_id)
+        # trade_blotter, tickers, data_dict = preprocess_data(df, platform)
+        # trade_blotter_filtered = trade_blotter.copy()
+
+        # Convert ndarray to list
+        instruments_list = tickers.tolist()
+
+        # Slippage Pie Chart
+        # start_date = trade_blotter_filtered['Activity Date'].min()
+        # start_date = '2022-08-17'
+        # end_date = trade_blotter_filtered['Activity Date'].max()
+        # end_date = '2024-04-16'
+        #end_date = '2024-08-16'
+        
+        stock = trade_blotter_filtered['Instrument'].unique().tolist()[0]
+        instruments_list = trade_blotter_filtered['Instrument'].unique().tolist()
+        benchmark = ['Close', 'Open', 'TWAP', 'VWAP', 'HWOE'][0]
+        # # slippage_pie_chart
+        # slippage_summary = data_fetching_and_preprocessing.slippage_pie_chart(trade_blotter_filtered, stock, start_date, end_date, benchmark)
+
+        # Line Chart
+        start_date = trade_blotter_filtered['Activity Date'].min()
+        end_date = trade_blotter_filtered['Activity Date'].max()
+        #trade_blotter_filtered_line = filter_tickers_for_line_charts(trade_blotter_filtered)
+        trade_blotter_filtered_line = trade_blotter.copy()
+        instruments_list_line = trade_blotter_filtered_line['Instrument'].tolist()
+        slippage_over_time = data_fetching_and_preprocessing.plot_excess_returns(trade_blotter_filtered_line, stock, show_open=True, show_close=True, show_twap=True, show_vwap=True, show_hwoe=True, start_date=start_date, end_date=end_date,hwoe_adjustment_factor=scaling_factor_report,aggregate=True)
+
+        # Slippage heatmap
+        # slippage_heatmap = data_fetching_and_preprocessing.calculate_slippage(trade_blotter_filtered, data_dict)
+        # slippage_heatmap_trade_option = data_fetching_and_preprocessing.calculate_slippage_trade_option(trade_blotter_filtered)
+
+        # Slippage Bar
+        slippage_bar = data_fetching_and_preprocessing.calculate_slippage_sums(trade_blotter,hwoe_adjustment_factor=scaling_factor_report)
+        slippage_bar_trade_option = data_fetching_and_preprocessing.calculate_slippage_bar_trade_option(trade_blotter_filtered)
+
+
+        # Candlestick chart
+        candlestick_trade_options = data_fetching_and_preprocessing.candle_stick_trade_option(trade_blotter_filtered)
+        candlestick_chart = data_fetching_and_preprocessing.setup_slippage_analysis(trade_blotter_filtered, data_dict, candlestick_trade_options[0])
+
+        # return JsonResponse({'stocks': instruments_list, 'date_range': { 'start_date': start_date, 'end_date': end_date }, 'slippage_pie_chart': slippage_summary, 'slippage_over_time': slippage_over_time, 'slippage_heatmap_summary': {'heatmap_data': slippage_heatmap, 'trade_option': slippage_heatmap_trade_option}, 'candle_stick_summary': { 'candle_stick_trade_option': candlestick_trade_options, 'candlestick_chart': candlestick_chart  } })
+        return JsonResponse({'stocks': instruments_list, 'stocks_for_line_chart': instruments_list, 'date_range': { 'start_date': start_date, 'end_date': end_date },'slippage_over_time': slippage_over_time, 'slippage_bar_summary': {'bar_data': slippage_bar, 'trade_option': slippage_bar_trade_option}, 'candle_stick_summary': { 'candle_stick_trade_option': candlestick_trade_options, 'candlestick_chart': candlestick_chart  } })
+
+    except Exception as e:
+        logger.error(f"Error fetching files: {str(e)}", exc_info=True)
+        return JsonResponse({'error': str(e)}, status=500)
+    
+
+@api_view(['GET'])
+# @permission_classes([IsAuthenticated])
+def blockhouse_analyze(request):
+    print('In Blockhouse Analyze')
+    try:
+        file_id = request.query_params.get('file_id')
+        platform = request.query_params.get('platform')
+        
+        # upload = UploadHoodWinked.objects.get(id=file_id)
+
+        # s3 = boto3.client('s3',
+        #                     aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        #                     aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        #                     region_name=settings.AWS_REGION)
+
+        # # s3.delete_object(Bucket=settings.AWS_STORAGE_BUCKET,
+        # #                     Key=upload.file_name)
+
+        # user_folder = str(upload.user_email)  # or use request.user.username
+        # s3_file_path = f"{user_folder}/{upload.file_name}"
+
+        # obj = s3.get_object(
+        #         Bucket=settings.AWS_STORAGE_BUCKET, Key=s3_file_path)
+        
+        # file_content = obj['Body'].read().decode('utf-8')
+
+        # df = pd.read_csv(StringIO(file_content))
+
+        # # data_fetching_and_preprocessing
+        # trade_blotter = data_fetching_and_preprocessing.preprocess_by_platform(df, platform)
+    
+        # # Fetch market data
+        # tickers = trade_blotter['Instrument'].unique()
+        # data_dict = data_fetching_and_preprocessing.fetch_market_data(tickers)
+        # trade_blotter = data_fetching_and_preprocessing.preprocess_data(trade_blotter, data_dict)
+
+        # trade_blotter_filtered = trade_blotter.copy()  # Create a filtered copy if needed
+        
+        cache_key = f"b_{platform}_{file_id}"
+        df = cache.get(key=cache_key)
+        trade_blotter = cache.get(key=f"b_{platform}_{file_id}_trade_blotter")
+        scaling_factor_report = cache.get(key=f"b_{platform}_{file_id}_scaling_factor")
+        #print(df)
+        if df is None or trade_blotter is None or scaling_factor_report is None: 
+            print('Not in Cache')
+            df= fetch_file_from_blockhouse_s3(file_id)
+            cache.set(key=cache_key, value=df, timeout=60*15)
+            trade_blotter, tickers, data_dict = preprocess_data_merged(df, platform)
+            cache.set(key=f"b_{platform}_{file_id}_trade_blotter", value=trade_blotter, timeout=60*15)
+            trade_blotter_filtered = trade_blotter.copy()
+            cache.set(key=f"b_{platform}_{file_id}_tickers", value=tickers, timeout=60*15)
+            cache.set(key=f"b_{platform}_{file_id}_data_dict", value=data_dict, timeout=60*15)
+            scaling_factor_report = reportCalculation.calculate_potential_savings(trade_blotter)['scaling_factor']
+            cache.set(key=f"b_{platform}_{file_id}_scaling_factor", value=scaling_factor_report, timeout=60*15)
+            
+            ##Set cache for report calculation
+            #reportCalculation.main(df, platform)
+        else:
+            print('In Cache')
+            df = cache.get(key=cache_key)
+            trade_blotter = cache.get(key=f"b_{platform}_{file_id}_trade_blotter")
+            tickers = cache.get(key=f"b_{platform}_{file_id}_tickers")
+            data_dict = cache.get(key=f"b_{platform}_{file_id}_data_dict")
+            scaling_factor_report = cache.get(key=f"b_{platform}_{file_id}_scaling_factor")
+            trade_blotter_filtered = trade_blotter.copy()
+            
+
+
+        #scaling_factor_report = reportCalculation.calculate_potential_savings(trade_blotter)['scaling_factor']
+        
+        # df = fetch_file_from_s3(file_id)
+        # trade_blotter, tickers, data_dict = preprocess_data(df, platform)
+        # trade_blotter_filtered = trade_blotter.copy()
+
+        # Convert ndarray to list
+        instruments_list = tickers.tolist()
+
+        # Slippage Pie Chart
+        # start_date = trade_blotter_filtered['Activity Date'].min()
+        # start_date = '2022-08-17'
+        # end_date = trade_blotter_filtered['Activity Date'].max()
+        # end_date = '2024-04-16'
+        #end_date = '2024-08-16'
+        
+        stock = trade_blotter_filtered['Instrument'].unique().tolist()[0]
+        instruments_list = trade_blotter_filtered['Instrument'].unique().tolist()
+        benchmark = ['Close', 'Open', 'TWAP', 'VWAP', 'HWOE'][0]
+        # # slippage_pie_chart
+        # slippage_summary = data_fetching_and_preprocessing.slippage_pie_chart(trade_blotter_filtered, stock, start_date, end_date, benchmark)
+
+        # Line Chart
+        start_date = trade_blotter_filtered['Activity Date'].min()
+        end_date = trade_blotter_filtered['Activity Date'].max()
+        #trade_blotter_filtered_line = filter_tickers_for_line_charts(trade_blotter_filtered)
+        trade_blotter_filtered_line = trade_blotter.copy()
+        instruments_list_line = trade_blotter_filtered_line['Instrument'].tolist()
+        slippage_over_time = data_fetching_and_preprocessing.plot_excess_returns(trade_blotter_filtered_line, stock, show_open=True, show_close=True, show_twap=True, show_vwap=True, show_hwoe=True, start_date=start_date, end_date=end_date,hwoe_adjustment_factor=scaling_factor_report,aggregate=True)
+
+        # Slippage heatmap
+        # slippage_heatmap = data_fetching_and_preprocessing.calculate_slippage(trade_blotter_filtered, data_dict)
+        # slippage_heatmap_trade_option = data_fetching_and_preprocessing.calculate_slippage_trade_option(trade_blotter_filtered)
+
+        # Slippage Bar
+        slippage_bar = data_fetching_and_preprocessing.calculate_slippage_sums(trade_blotter,hwoe_adjustment_factor=scaling_factor_report)
+        slippage_bar_trade_option = data_fetching_and_preprocessing.calculate_slippage_bar_trade_option(trade_blotter_filtered)
+
+
+        # Candlestick chart
+        candlestick_trade_options = data_fetching_and_preprocessing.candle_stick_trade_option(trade_blotter_filtered)
+        candlestick_chart = data_fetching_and_preprocessing.setup_slippage_analysis(trade_blotter_filtered, data_dict, candlestick_trade_options[0])
+
+        # return JsonResponse({'stocks': instruments_list, 'date_range': { 'start_date': start_date, 'end_date': end_date }, 'slippage_pie_chart': slippage_summary, 'slippage_over_time': slippage_over_time, 'slippage_heatmap_summary': {'heatmap_data': slippage_heatmap, 'trade_option': slippage_heatmap_trade_option}, 'candle_stick_summary': { 'candle_stick_trade_option': candlestick_trade_options, 'candlestick_chart': candlestick_chart  } })
+        return JsonResponse({'stocks': instruments_list, 'stocks_for_line_chart': instruments_list, 'date_range': { 'start_date': start_date, 'end_date': end_date },'slippage_over_time': slippage_over_time, 'slippage_bar_summary': {'bar_data': slippage_bar, 'trade_option': slippage_bar_trade_option}, 'candle_stick_summary': { 'candle_stick_trade_option': candlestick_trade_options, 'candlestick_chart': candlestick_chart  } })
+
+    except Exception as e:
+        logger.error(f"Error fetching files: {str(e)}", exc_info=True)
+        return JsonResponse({'error': str(e)}, status=500)
+    
+
+@csrf_exempt
+@api_view(['GET'])
+# @permission_classes([IsAuthenticated])
+def hoodwinked_analyze_plaid(request):
+    print('In Hoodwinked Analyze')
+    try:
+        email = request.query_params.get('email')
+        platform = request.query_params.get('platform')
+        
+        
+        # upload = UploadHoodWinked.objects.get(id=file_id)
+
+        # s3 = boto3.client('s3',
+        #                     aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        #                     aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        #                     region_name=settings.AWS_REGION)
+
+        # # s3.delete_object(Bucket=settings.AWS_STORAGE_BUCKET,
+        # #                     Key=upload.file_name)
+
+        # user_folder = str(upload.user_email)  # or use request.user.username
+        # s3_file_path = f"{user_folder}/{upload.file_name}"
+
+        # obj = s3.get_object(
+        #         Bucket=settings.AWS_STORAGE_BUCKET, Key=s3_file_path)
+        
+        # file_content = obj['Body'].read().decode('utf-8')
+
+        # df = pd.read_csv(StringIO(file_content))
+
+        # # data_fetching_and_preprocessing
+        # trade_blotter = data_fetching_and_preprocessing.preprocess_by_platform(df, platform)
+    
+        # # Fetch market data
+        # tickers = trade_blotter['Instrument'].unique()
+        # data_dict = data_fetching_and_preprocessing.fetch_market_data(tickers)
+        # trade_blotter = data_fetching_and_preprocessing.preprocess_data(trade_blotter, data_dict)
+
+        # trade_blotter_filtered = trade_blotter.copy()  # Create a filtered copy if needed
+        file_id = email
+        cache_key = f"{platform}_{file_id}"
+        df = cache.get(key=cache_key)
+        trade_blotter = cache.get(key=f"{platform}_{file_id}_trade_blotter")
+        scaling_factor_report = cache.get(key=f"{platform}_{file_id}_scaling_factor")
+        #print(df)
+        if df is None or trade_blotter is None or scaling_factor_report is None: 
+            print('Not in Cache')
+            #df= fetch_file_from_s3(file_id)
+            df = fetch_latest_file_from_s3(email)
+            cache.set(key=cache_key, value=df, timeout=60*15)
+            trade_blotter, tickers, data_dict = preprocess_data_merged(df, platform)
+            cache.set(key=f"{platform}_{file_id}_trade_blotter", value=trade_blotter, timeout=60*15)
+            trade_blotter_filtered = trade_blotter.copy()
+            cache.set(key=f"{platform}_{file_id}_tickers", value=tickers, timeout=60*15)
+            cache.set(key=f"{platform}_{file_id}_data_dict", value=data_dict, timeout=60*15)
+            scaling_factor_report = reportCalculation.calculate_potential_savings(trade_blotter)['scaling_factor']
+            cache.set(key=f"{platform}_{file_id}_scaling_factor", value=scaling_factor_report, timeout=60*15)
+            
+            ##Set cache for report calculation
+            #reportCalculation.main(df, platform)
+        else:
+            print('In Cache')
+            df = cache.get(key=cache_key)
+            trade_blotter = cache.get(key=f"{platform}_{file_id}_trade_blotter")
+            tickers = cache.get(key=f"{platform}_{file_id}_tickers")
+            data_dict = cache.get(key=f"{platform}_{file_id}_data_dict")
+            scaling_factor_report = cache.get(key=f"{platform}_{file_id}_scaling_factor")
+            trade_blotter_filtered = trade_blotter.copy()
+            
+
+
+        #scaling_factor_report = reportCalculation.calculate_potential_savings(trade_blotter)['scaling_factor']
+        
+        # df = fetch_file_from_s3(file_id)
+        # trade_blotter, tickers, data_dict = preprocess_data(df, platform)
+        # trade_blotter_filtered = trade_blotter.copy()
+
+        # Convert ndarray to list
+        instruments_list = tickers.tolist()
+
+        # Slippage Pie Chart
+        # start_date = trade_blotter_filtered['Activity Date'].min()
+        # start_date = '2022-08-17'
+        # end_date = trade_blotter_filtered['Activity Date'].max()
+        # end_date = '2024-04-16'
+        #end_date = '2024-08-16'
+        
+        stock = trade_blotter_filtered['Instrument'].unique().tolist()[0]
+        instruments_list = trade_blotter_filtered['Instrument'].unique().tolist()
+        benchmark = ['Close', 'Open', 'TWAP', 'VWAP', 'HWOE'][0]
+        # # slippage_pie_chart
+        # slippage_summary = data_fetching_and_preprocessing.slippage_pie_chart(trade_blotter_filtered, stock, start_date, end_date, benchmark)
+
+        # Line Chart
+        start_date = trade_blotter_filtered['Activity Date'].min()
+        end_date = trade_blotter_filtered['Activity Date'].max()
+        #trade_blotter_filtered_line = filter_tickers_for_line_charts(trade_blotter_filtered)
+        trade_blotter_filtered_line = trade_blotter.copy()
+        instruments_list_line = trade_blotter_filtered_line['Instrument'].tolist()
+        slippage_over_time = data_fetching_and_preprocessing.plot_excess_returns(trade_blotter_filtered_line, stock, show_open=True, show_close=True, show_twap=True, show_vwap=True, show_hwoe=True, start_date=start_date, end_date=end_date,hwoe_adjustment_factor=scaling_factor_report,aggregate=True)
+
+        # Slippage heatmap
+        # slippage_heatmap = data_fetching_and_preprocessing.calculate_slippage(trade_blotter_filtered, data_dict)
+        # slippage_heatmap_trade_option = data_fetching_and_preprocessing.calculate_slippage_trade_option(trade_blotter_filtered)
+
+        # Slippage Bar
+        slippage_bar = data_fetching_and_preprocessing.calculate_slippage_sums(trade_blotter,hwoe_adjustment_factor=scaling_factor_report)
+        slippage_bar_trade_option = data_fetching_and_preprocessing.calculate_slippage_bar_trade_option(trade_blotter_filtered)
+
+
+        # Candlestick chart
+        candlestick_trade_options = data_fetching_and_preprocessing.candle_stick_trade_option(trade_blotter_filtered)
+        candlestick_chart = data_fetching_and_preprocessing.setup_slippage_analysis(trade_blotter_filtered, data_dict, candlestick_trade_options[0])
+
+        # return JsonResponse({'stocks': instruments_list, 'date_range': { 'start_date': start_date, 'end_date': end_date }, 'slippage_pie_chart': slippage_summary, 'slippage_over_time': slippage_over_time, 'slippage_heatmap_summary': {'heatmap_data': slippage_heatmap, 'trade_option': slippage_heatmap_trade_option}, 'candle_stick_summary': { 'candle_stick_trade_option': candlestick_trade_options, 'candlestick_chart': candlestick_chart  } })
+        return JsonResponse({'stocks': instruments_list, 'stocks_for_line_chart': instruments_list, 'date_range': { 'start_date': start_date, 'end_date': end_date },'slippage_over_time': slippage_over_time, 'slippage_bar_summary': {'bar_data': slippage_bar, 'trade_option': slippage_bar_trade_option}, 'candle_stick_summary': { 'candle_stick_trade_option': candlestick_trade_options, 'candlestick_chart': candlestick_chart  } })
+
+    except Exception as e:
+        logger.error(f"Error fetching files: {str(e)}", exc_info=True)
+        return JsonResponse({'error': str(e)}, status=500)
+    
+import time
+@api_view(['GET'])
+# @permission_classes([IsAuthenticated])
+def hoodwinked_graph(request):
+    try:
+        file_id = request.query_params.get('file_id')
+        platform = request.query_params.get('platform')
+        site = request.query_params.get('site')
+        chart_type = request.query_params.get('chart_type')
+        trade_option = request.query_params.get('trade_option')
+        stock = request.query_params.get('stock')
+        show_open = request.query_params.get('show_open')
+        show_close = request.query_params.get('show_close')
+        show_twap = request.query_params.get('show_twap')
+        show_vwap = request.query_params.get('show_vwap')
+        show_hwoe = request.query_params.get('show_hwoe')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        benchmark = request.query_params.get('benchmark')
+        
+        
+
+
+        
+        # Fetching the file
+        # upload = UploadHoodWinked.objects.get(id=file_id)
+        # s3 = boto3.client('s3',
+        #                     aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        #                     aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        #                     region_name=settings.AWS_REGION)
+
+        # user_folder = str(upload.user_email)  # or use request.user.username
+        # s3_file_path = f"{user_folder}/{upload.file_name}"
+
+        # obj = s3.get_object(
+        #         Bucket=settings.AWS_STORAGE_BUCKET, Key=s3_file_path)
+        
+        # file_content = obj['Body'].read().decode('utf-8')
+
+        # # Read the file through dataFrame
+        # df = pd.read_csv(StringIO(file_content))
+
+        # # data_fetching_and_preprocessing
+        # trade_blotter = data_fetching_and_preprocessing.preprocess_by_platform(df, platform)
+    
+        # # Fetch market data
+        # tickers = trade_blotter['Instrument'].unique()
+        # data_dict = data_fetching_and_preprocessing.fetch_market_data(tickers)
+        # trade_blotter = data_fetching_and_preprocessing.preprocess_data(trade_blotter, data_dict)
+        # trade_blotter_filtered = trade_blotter.copy()  # Create a filtered copy if needed
+        cache_key = f"{platform}_{file_id}"
+        df = cache.get(key=cache_key)
+        trade_blotter = cache.get(key=f"{platform}_{file_id}_trade_blotter")
+        scaling_factor_report = cache.get(key=f"{platform}_{file_id}_scaling_factor")
+        #print(df)
+        if df is None or trade_blotter is None or scaling_factor_report is None: 
+            print('Not in Cache')
+            df= fetch_file_from_s3(file_id, site)
+            cache.set(key=cache_key, value=df, timeout=60*15)
+            trade_blotter, tickers, data_dict = preprocess_data_merged(df, platform)
+            cache.set(key=f"{platform}_{file_id}_trade_blotter", value=trade_blotter, timeout=60*15)
+            trade_blotter_filtered = trade_blotter.copy()
+            cache.set(key=f"{platform}_{file_id}_tickers", value=tickers, timeout=60*15)
+            cache.set(key=f"{platform}_{file_id}_data_dict", value=data_dict, timeout=60*15)
+            scaling_factor_report = reportCalculation.calculate_potential_savings(trade_blotter)['scaling_factor']
+            cache.set(key=f"{platform}_{file_id}_scaling_factor", value=scaling_factor_report, timeout=60*15)
+            
+            ##Set cache for report calculation
+            #reportCalculation.main(df, platform)
+        else:
+            print('In Cache')
+            df = cache.get(key=cache_key)
+            trade_blotter = cache.get(key=f"{platform}_{file_id}_trade_blotter")
+            tickers = cache.get(key=f"{platform}_{file_id}_tickers")
+            data_dict = cache.get(key=f"{platform}_{file_id}_data_dict")
+            scaling_factor_report = cache.get(key=f"{platform}_{file_id}_scaling_factor")
+            trade_blotter_filtered = trade_blotter.copy()
+
+        # Convert ndarray to list
+        instruments_list = tickers.tolist()
+
+        if(chart_type == 'slippage_pie_chart'):
+            # Slippage Pie Chart
+            slippage_summary = data_fetching_and_preprocessing.slippage_pie_chart(trade_blotter_filtered, stock, start_date, end_date, benchmark)
+            return JsonResponse({'slippage_pie_chart': slippage_summary})
+        elif(chart_type == 'slippage_over_time'):
+            # Line Chart
+            if stock is None or stock == 'all_trades':
+                aggregate = True
+            else:
+                aggregate = False
+            #trade_blotter_filtered_line = filter_tickers_for_line_charts(trade_blotter_filtered)
+            slippage_over_time = data_fetching_and_preprocessing.plot_excess_returns(trade_blotter_filtered, stock, show_open=show_open, show_close=show_close, show_twap=show_twap, show_vwap=show_vwap, show_hwoe=show_hwoe, start_date=start_date, end_date=end_date,hwoe_adjustment_factor=scaling_factor_report,aggregate=aggregate)
+            return JsonResponse({'slippage_over_time': slippage_over_time})
+        elif(chart_type == 'slippage_bar'):
+            # Slippage bar
+            slippage_bar = data_fetching_and_preprocessing.calculate_slippage_sums(trade_blotter_filtered, trade_option,hwoe_adjustment_factor=scaling_factor_report)
+            print(slippage_bar)
+            return JsonResponse({'slippage_bar_data': slippage_bar})
+        # elif(chart_type == 'slippage_heatmap'):
+        #     # Slippage heatmap
+        #     slippage_heatmap = data_fetching_and_preprocessing.calculate_slippage(trade_blotter_filtered, data_dict, trade_option)
+        #     return JsonResponse({'heatmap_data': slippage_heatmap})
+        elif(chart_type == 'candle_stick'):
+            # Candlestick chart 
+            print(trade_option)
+            candlestick_chart = data_fetching_and_preprocessing.setup_slippage_analysis(trade_blotter_filtered, data_dict, trade_option)
+            return JsonResponse({'candlestick_chart': candlestick_chart})
+
+    except Exception as e:
+        logger.error(f"Error fetching files: {str(e)}", exc_info=True)
+        return JsonResponse({'error': str(e)}, status=500)
+
+@api_view(['GET'])
+# @permission_classes([IsAuthenticated])    
+def hoodwinked_graph_plaid(request):
+    try:
+        email = request.query_params.get('email')
+        file_id = email
+        # file_id = request.query_params.get('file_id')
+        platform = request.query_params.get('platform')
+        site = request.query_params.get('site')
+        chart_type = request.query_params.get('chart_type')
+        trade_option = request.query_params.get('trade_option')
+        stock = request.query_params.get('stock')
+        show_open = request.query_params.get('show_open')
+        show_close = request.query_params.get('show_close')
+        show_twap = request.query_params.get('show_twap')
+        show_vwap = request.query_params.get('show_vwap')
+        show_hwoe = request.query_params.get('show_hwoe')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        benchmark = request.query_params.get('benchmark')
+        
+        print("Trade Options: ", trade_option)
+
+        # Fetching the file
+        # upload = UploadHoodWinked.objects.get(id=file_id)
+        # s3 = boto3.client('s3',
+        #                     aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        #                     aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        #                     region_name=settings.AWS_REGION)
+
+        # user_folder = str(upload.user_email)  # or use request.user.username
+        # s3_file_path = f"{user_folder}/{upload.file_name}"
+
+        # obj = s3.get_object(
+        #         Bucket=settings.AWS_STORAGE_BUCKET, Key=s3_file_path)
+        
+        # file_content = obj['Body'].read().decode('utf-8')
+
+        # # Read the file through dataFrame
+        # df = pd.read_csv(StringIO(file_content))
+
+        # # data_fetching_and_preprocessing
+        # trade_blotter = data_fetching_and_preprocessing.preprocess_by_platform(df, platform)
+    
+        # # Fetch market data
+        # tickers = trade_blotter['Instrument'].unique()
+        # data_dict = data_fetching_and_preprocessing.fetch_market_data(tickers)
+        # trade_blotter = data_fetching_and_preprocessing.preprocess_data(trade_blotter, data_dict)
+        # trade_blotter_filtered = trade_blotter.copy()  # Create a filtered copy if needed
+        cache_key = f"{platform}_{file_id}"
+        df = cache.get(key=cache_key)
+        trade_blotter = cache.get(key=f"{platform}_{file_id}_trade_blotter")
+        scaling_factor_report = cache.get(key=f"{platform}_{file_id}_scaling_factor")
+        #print(df)
+        if df is None or trade_blotter is None or scaling_factor_report is None: 
+            print('Not in Cache')
+            df= fetch_latest_file_from_s3(email)
+            cache.set(key=cache_key, value=df, timeout=60*15)
+            
+            trade_blotter, tickers, data_dict = preprocess_data_merged(df, platform)
+            cache.set(key=f"{platform}_{file_id}_trade_blotter", value=trade_blotter, timeout=60*15)
+            
+            trade_blotter_filtered = trade_blotter.copy()
+            cache.set(key=f"{platform}_{file_id}_tickers", value=tickers, timeout=60*15)
+            cache.set(key=f"{platform}_{file_id}_data_dict", value=data_dict, timeout=60*15)
+            
+            scaling_factor_report = reportCalculation.calculate_potential_savings(trade_blotter)['scaling_factor']
+            cache.set(key=f"{platform}_{file_id}_scaling_factor", value=scaling_factor_report, timeout=60*15)
+            
+            ##Set cache for report calculation
+            #reportCalculation.main(df, platform)
+        else:
+            print('In Cache')
+            df = cache.get(key=cache_key)
+            trade_blotter = cache.get(key=f"{platform}_{file_id}_trade_blotter")
+            tickers = cache.get(key=f"{platform}_{file_id}_tickers")
+            data_dict = cache.get(key=f"{platform}_{file_id}_data_dict")
+            scaling_factor_report = cache.get(key=f"{platform}_{file_id}_scaling_factor")
+            trade_blotter_filtered = trade_blotter.copy()
+
+        # Convert ndarray to list
+        if isinstance(tickers, list):
+            instruments_list = tickers
+        else:
+            instruments_list = tickers.tolist()
+
+        if(chart_type == 'slippage_pie_chart'):
+            print("Slippage-Pie-Chart")
+            # Slippage Pie Chart
+
+            print("Trade Blotter: ", trade_blotter_filtered)
+
+            start_date = trade_blotter_filtered['Activity Date'].min()
+            end_date = trade_blotter_filtered['Activity Date'].max()
+
+            print("DATES: \n")
+            print(start_date)
+            print(end_date)
+            
+            stock = trade_blotter_filtered['Instrument'].unique().tolist()[0]
+            instruments_list = trade_blotter_filtered['Instrument'].unique().tolist()
+            benchmark = ['Close', 'Open', 'TWAP', 'VWAP', 'HWOE'][0]
+
+            print("Benchmark:", benchmark)
+            
+            slippage_summary = data_fetching_and_preprocessing.slippage_pie_chart(trade_blotter_filtered, stock, start_date, end_date, benchmark)
+            return JsonResponse({'slippage_pie_chart': slippage_summary})
+        
+        elif(chart_type == 'slippage_over_time'):
+            # Line Chart
+            if stock is None or stock == 'all_trades':
+                aggregate = True
+            else:
+                aggregate = False
+            
+            # Line Chart
+            start_date = trade_blotter_filtered['Activity Date'].min()
+            end_date = trade_blotter_filtered['Activity Date'].max()
+            
+            trade_blotter_filtered_line = trade_blotter.copy()
+            instruments_list_line = trade_blotter_filtered_line['Instrument'].tolist()
+            
+            slippage_over_time = data_fetching_and_preprocessing.plot_excess_returns(trade_blotter_filtered_line, stock, show_open=True, show_close=True, show_twap=True, show_vwap=True, show_hwoe=True, start_date=start_date, end_date=end_date,hwoe_adjustment_factor=scaling_factor_report,aggregate=True)
+            return JsonResponse({'slippage_over_time': slippage_over_time})
+        
+        elif(chart_type == 'slippage_bar'):
+            # Slippage bar
+
+            slippage_bar = data_fetching_and_preprocessing.calculate_slippage_sums_plaid(trade_blotter_filtered, trade_option,hwoe_adjustment_factor=scaling_factor_report)
+            
+            # slippage_bar = data_fetching_and_preprocessing.calculate_slippage_sums(trade_blotter,hwoe_adjustment_factor=scaling_factor_report)
+            # slippage_bar_trade_option = data_fetching_and_preprocessing.calculate_slippage_bar_trade_option(trade_blotter_filtered)
+            
+            return JsonResponse({'slippage_bar_data': slippage_bar})
+        
+        # elif(chart_type == 'slippage_heatmap'):
+        #     # Slippage heatmap
+        #     slippage_heatmap = data_fetching_and_preprocessing.calculate_slippage(trade_blotter_filtered, data_dict, trade_option)
+        #     return JsonResponse({'heatmap_data': slippage_heatmap})
+        
+        elif(chart_type == 'candle_stick'):
+            # Candlestick chart 
+            print(trade_option)
+            candlestick_trade_options = data_fetching_and_preprocessing.candle_stick_trade_option(trade_blotter_filtered)
+            candlestick_chart = data_fetching_and_preprocessing.setup_slippage_analysis(trade_blotter_filtered, data_dict, candlestick_trade_options[0])
+            return JsonResponse({'candlestick_chart': candlestick_chart})
+
+    except Exception as e:
+        logger.error(f"Error fetching files: {str(e)}", exc_info=True)
+        return JsonResponse({'error': str(e)}, status=500)
+    
+def fetch_latest_file_from_s3(user_email):
+    s3 = boto3.client('s3',
+                      aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                      aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                      region_name=settings.AWS_REGION)
+    
+    user_folder = user_folder = f"hoodwinked/plaid/{user_email}"
+    
+  
+    response = s3.list_objects_v2(Bucket=settings.AWS_STORAGE_BUCKET, Prefix=f"{user_folder}/")
+    if 'Contents' not in response:
+        raise FileNotFoundError(f"No files found for user {user_email}")
+    
+    files = sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True)
+    
+    latest_file_key = files[0]['Key']
+    
+    obj = s3.get_object(Bucket=settings.AWS_STORAGE_BUCKET, Key=latest_file_key)
+    file_content = obj['Body'].read().decode('utf-8')
+    
+    df = pd.read_csv(StringIO(file_content))
+    
+    return df
+
+
+def fetch_file_from_s3(file_id, site=None, siteType=None):
+    if site is None:
+        upload = UploadHoodWinked.objects.get(id=file_id)
+    else:
+        upload = UploadBlockhouse.objects.get(id=file_id)
+    s3 = boto3.client('s3',
+                      aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                      aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                      region_name=settings.AWS_REGION)
+    user_folder = str(upload.user_email)  # or use request.user.username
+    if site is None:
+        s3_file_path = f"hoodwinked/app/{user_folder}/{upload.file_name}"
+    else:
+        if siteType == 'demo':
+            s3_file_path = f"Blockhouse/demo/{user_folder}/{upload.file_name}"
+        else:
+            s3_file_path = f"Blockhouse/app/{user_folder}/{upload.file_name}"
+    obj = s3.get_object(Bucket=settings.AWS_STORAGE_BUCKET, Key=s3_file_path)
+    file_content = obj['Body'].read().decode('utf-8')
+    df = pd.read_csv(StringIO(file_content))
+    return df
+
+def fetch_file_from_blockhouse_s3(file_id):
+    upload = UploadBlockhouse.objects.get(id=file_id)
+    s3 = boto3.client('s3',
+                      aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                      aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                      region_name=settings.AWS_REGION)
+    user_folder = str(upload.user_email)  # or use request.user.username
+    s3_file_path = f"Blockhouse/app/{user_folder}/{upload.file_name}"
+    obj = s3.get_object(Bucket=settings.AWS_STORAGE_BUCKET, Key=s3_file_path)
+    file_content = obj['Body'].read().decode('utf-8')
+    df = pd.read_csv(StringIO(file_content))
+    return df
+    
+
+def preprocess_data(df, platform):
+    trade_blotter = data_fetching_and_preprocessing.preprocess_by_platform(df, platform)
+    trade_blotter = reportCalculation.preprocess_data(trade_blotter)
+    tickers = trade_blotter['Instrument'].unique()
+    data_dict, available_tickers = data_fetching_and_preprocessing.fetch_market_data(tickers)
+    trade_blotter = trade_blotter[trade_blotter['Instrument'].isin(available_tickers)]
+    trade_blotter = data_fetching_and_preprocessing.preprocess_data(trade_blotter, data_dict)
+    return trade_blotter, tickers, data_dict
+
+def preprocess_data_merged(df, platform):
+    trade_blotter = data_fetching_and_preprocessing.preprocess_by_platform(df, platform)
+    tickers = trade_blotter['Instrument'].unique()
+    trade_blotter, data_dict = data_fetching_and_preprocessing.preprocess_data_merged(trade_blotter)
+    return trade_blotter, tickers, data_dict
+
+#This code will remove rows where the instrument appears only once or where the activity date corresponding to the instrument appears only once.
+def filter_tickers_for_line_charts(trade_blotter):
+
+    instrument_unique_dates = trade_blotter.groupby('Instrument')['Activity Date'].nunique()
+    instruments_to_keep = instrument_unique_dates[instrument_unique_dates > 1].index
+    filtered_df = trade_blotter[trade_blotter['Instrument'].isin(instruments_to_keep)]
+
+    return filtered_df
+
+
+
+
+@csrf_exempt
+def hoodwinked_get_initial_metrics(request):
+    try:
+        # Get the JWT from the Authorization header
+        # auth_header = request.headers.get('Authorization')
+        # if not auth_header:
+        #     return JsonResponse({'error': 'Authorization header missing'}, status=401)
+
+        # token = auth_header.split(' ')[1]
+        # try:
+        #     # Decode JWT to get user information
+        #     decoded = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=['HS256'])
+        #     user_email = decoded.get('email')
+
+        #     if not user_email:
+        #         return JsonResponse({'error': 'Email not found in token'}, status=401)
+
+        # except jwt.ExpiredSignatureError:
+        #     return JsonResponse({'error': 'Token has expired'}, status=401)
+        # except jwt.InvalidTokenError:
+        #     return JsonResponse({'error': 'Invalid token'}, status=401)
+
+        user_email = request.GET.get('email')
+        uploads = UploadHoodWinked.objects.filter(user_email=user_email).values()
+        
+        if not uploads:
+            return JsonResponse({'last_trade_value': None, 'metric2': None, 'metric3': None})
+            #return JsonResponse({'error': 'No files found'}, status=404)
+        
+        latest_file = list(uploads)[-1]  
+        file_id = latest_file.get('id')
+        platform = latest_file.get('platform')
+        
+        
+        cache_key = f"{platform}_{file_id}"
+        df = cache.get(key=cache_key)
+        trade_blotter = cache.get(key=f"{platform}_{file_id}_trade_blotter")
+        scaling_factor_report = cache.get(key=f"{platform}_{file_id}_scaling_factor")
+        #print(df)
+        if df is None or trade_blotter is None or scaling_factor_report is None: 
+            print('Not in Cache')
+            df= fetch_file_from_s3(file_id)
+            cache.set(key=cache_key, value=df, timeout=60*15)
+            trade_blotter, tickers, data_dict = preprocess_data_merged(df, platform)
+            cache.set(key=f"{platform}_{file_id}_trade_blotter", value=trade_blotter, timeout=60*15)
+            trade_blotter_filtered = trade_blotter.copy()
+            cache.set(key=f"{platform}_{file_id}_tickers", value=tickers, timeout=60*15)
+            cache.set(key=f"{platform}_{file_id}_data_dict", value=data_dict, timeout=60*15)
+            scaling_factor_report = reportCalculation.calculate_potential_savings(trade_blotter)['scaling_factor']
+            cache.set(key=f"{platform}_{file_id}_scaling_factor", value=scaling_factor_report, timeout=60*15)
+            
+            ##Set cache for report calculation
+            #reportCalculation.main(df, platform)
+        else:
+            print('In Cache')
+            df = cache.get(key=cache_key)
+            trade_blotter = cache.get(key=f"{platform}_{file_id}_trade_blotter")
+            tickers = cache.get(key=f"{platform}_{file_id}_tickers")
+            data_dict = cache.get(key=f"{platform}_{file_id}_data_dict")
+            scaling_factor_report = cache.get(key=f"{platform}_{file_id}_scaling_factor")
+            trade_blotter_filtered = trade_blotter.copy()
+            
+        # Calculate the value of the last trade
+        trade_blotter_sorted = trade_blotter.sort_values(by='Activity Date', ascending=False)
+        last_trade = trade_blotter_sorted.iloc[0]
+        last_trade_value = last_trade['Price'] * last_trade['Quantity']
+        
+        
+        # Get the most recent trade
+        last_trade = trade_blotter_sorted.iloc[0]
+        # Format the trade options
+        trade_option = f"{last_trade.name}: {last_trade['Instrument']} {last_trade['Trans Code']} {last_trade['Quantity']} @ ${last_trade['Price']} on {last_trade['Activity Date']}"
+        stock = last_trade['Instrument']
+        slippage_bar = data_fetching_and_preprocessing.calculate_slippage_sums(trade_blotter_filtered, trade_option,hwoe_adjustment_factor=scaling_factor_report)
+        metric2 = slippage_bar['HWOE']
+        
+        start_date = trade_blotter_filtered['Activity Date'].min()
+        end_date = trade_blotter_filtered['Activity Date'].max()
+        trade_blotter_filtered_line = trade_blotter.copy()
+        slippage_over_time = data_fetching_and_preprocessing.plot_excess_returns(trade_blotter_filtered_line, stock, show_open=True, show_close=True, show_twap=True, show_vwap=True, show_hwoe=True, start_date=start_date, end_date=end_date,hwoe_adjustment_factor=scaling_factor_report,aggregate=True)
+        metric3 = slippage_over_time['HWOE'][-1]['HWOE_Excess_Returns']
+
+        
+        return JsonResponse({'last_trade_value': last_trade_value, 'metric2': metric2, 'metric3': metric3})
+
+    except Exception as e:
+        logger.error(f"Error fetching files: {str(e)}", exc_info=True)
+        return JsonResponse({'error': str(e)}, status=500)
+    
+import requests 
+@api_view(['GET'])
+def process_pipeline_for_ticker(request):
+
+    ticker = request.query_params.get('ticker')
+    inventory = request.query_params.get('inventory')
+    timeframe = request.query_params.get('timeframe')
+    
+    # Step 0: Validate the ticker using Polygon.io API
+    polygon_url = f'https://api.polygon.io/v3/reference/tickers/{ticker}?'
+    api_key = settings.POLYGON_API_KEY
+    params = {
+        'apiKey': api_key
+    }
+
+    try:
+        polygon_response = requests.get(polygon_url, params=params)
+        if polygon_response.status_code == 404:
+            return JsonResponse({'error': 'Invalid ticker.'}, status=400)
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching ticker data from Polygon.io: {e}")
+        return JsonResponse({'error': 'Failed to validate ticker.'}, status=500)
+
+    try:
+        # fastapi_url = f"https://fastapi.blockhouse.app/run-pipeline/{ticker}&{inventory}&{timeframe}"
+        # response = requests.get(fastapi_url)
+
+        # if response.status_code == 200:
+        #     results = response.json()
+        #     # Further processing of results if needed
+        #     print(f"Pipeline results for {ticker}: {results}")
+        #     return JsonResponse(results)
+        # else:
+        #     response.raise_for_status()
+        payload = {
+            "ticker": ticker,
+            "action": "sell",
+            "inventory": int(inventory),
+            "timeframe": int(timeframe)
+        }
+        results = get_inference_response(payload)
+        print(f"Pipeline results for {ticker}: {results}")
+        return JsonResponse({
+            'ticker': ticker,
+            'inventory': inventory,
+            'results': results
+        })
+        # return JsonResponse(results, safe=False)
+
+    except requests.exceptions.RequestException as e:
+        # Log the error for further analysis
+        print(f"Error fetching pipeline results from FastAPI: {e}")
+        return JsonResponse({'error': f"Failed to fetch or process pipeline results for {ticker}."}, status=400)
+    
+    
+    
+    
+@api_view(['GET'])
+def process_pipeline_for_ticker_buy(request):
+
+    ticker = request.query_params.get('ticker')
+    inventory = request.query_params.get('inventory')
+    timeframe = request.query_params.get('timeframe')
+    
+    # Step 0: Validate the ticker using Polygon.io API
+    polygon_url = f'https://api.polygon.io/v3/reference/tickers/{ticker}?'
+    api_key = settings.POLYGON_API_KEY
+    params = {
+        'apiKey': api_key
+    }
+
+    try:
+        polygon_response = requests.get(polygon_url, params=params)
+        if polygon_response.status_code == 404:
+            return JsonResponse({'error': 'Invalid ticker.'}, status=400)
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching ticker data from Polygon.io: {e}")
+        return JsonResponse({'error': 'Failed to validate ticker.'}, status=500)
+
+    try:
+        # fastapi_url = f"https://fastapi.blockhouse.app/run-pipeline-buy/{ticker}&{inventory}&{timeframe}"
+        # response = requests.get(fastapi_url)
+
+        # if response.status_code == 200:
+        #     results = response.json()
+        #     # Further processing of results if needed
+        #     print(f"Pipeline results for {ticker}: {results}")
+        #     return JsonResponse(results)
+        # else:
+        #     response.raise_for_status()
+        payload = {
+            "ticker": ticker,
+            "action": "buy",
+            "inventory": int(inventory),
+            "timeframe": int(timeframe)
+        }
+        results = get_inference_response(payload)
+        print(f"Pipeline results for {ticker}: {results}")
+        return JsonResponse({
+            'ticker': ticker,
+            'inventory': inventory,
+            'results': results
+        })
+        # return JsonResponse(results, safe=False)
+
+    except requests.exceptions.RequestException as e:
+        # Log the error for further analysis
+        print(f"Error fetching pipeline results from FastAPI: {e}")
+        return JsonResponse({'error': f"Failed to fetch or process pipeline results for {ticker}."}, status=400)
+    
+    
+def get_inference_response(payload):
+    try:
+        request_body = json.dumps(payload)
+        # Create a low-level client representing Amazon SageMaker Runtime
+        sagemaker_runtime = boto3.client(
+            "sagemaker-runtime", 
+            region_name=settings.AWS_REGION, 
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID, 
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY
+        )
+        # Make the prediction
+        response = sagemaker_runtime.invoke_endpoint(
+            EndpointName='endpoint-real-time-inference24', 
+            Body=request_body, 
+            ContentType='application/json',
+            InferenceComponentName='model-real-time-inference24-inference-component'
+        )
+        # Decodes the response body and converts it into a JSON object:
+        response_body = response['Body'].read().decode('utf-8')
+        response_json = json.loads(response_body)
+        return response_json
+    except Exception as e:
+        print(f"Error in get_inference_response: {str(e)}")
+        # return None
+        return JsonResponse({'error': f"Error in get_inference_response: {str(e)}"}, status=400)
+
+@csrf_exempt
+@api_view(['POST'])
+def plaid_data_to_csv(request):
+    # Extract json_data and user_email from the request body
+    json_data = request.data.get('json_data')
+    user_email = request.data.get('user_email')
+
+
+    if not json_data or not user_email:
+        return JsonResponse({'error': 'json_data and user_email are required.'}, status=400)
+
+    if not isinstance(json_data, list) or len(json_data) == 0:
+        return JsonResponse({'error': 'json_data must be a non-empty list.'}, status=400)
+
+    # Generate CSV data
+    output = StringIO()
+    csv_writer = csv.writer(output)
+    csv_writer.writerow(json_data[0].keys())
+    for item in json_data:
+        csv_writer.writerow(item.values())
+
+    # Define user folder and file name
+    user_folder = f"hoodwinked/plaid/{user_email}"
+    timestamp = datetime.now().strftime('%Y%m%d')
+    s3_file_name = f"PLAID_transactions-{timestamp}.csv"
+    
+    s3_file_path = f"{user_folder}/{s3_file_name}"
+
+    # Upload CSV to S3
+    s3 = boto3.client('s3',
+                      aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                      aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                      region_name=settings.AWS_REGION)
+    
+    try:
+        s3.put_object(Bucket=settings.AWS_STORAGE_BUCKET, Key=s3_file_path, Body=output.getvalue())
+    except Exception as e:
+        return JsonResponse({'error': f'Failed to upload CSV to S3: {str(e)}'}, status=500)
+
+    return JsonResponse({'message': 'CSV file created and uploaded to S3 successfully.'})
+

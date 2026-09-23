@@ -1,0 +1,5 @@
+name: sagemaker_env
+channels:
+  - conda-forge
+dependencies:
+  - ta-lib

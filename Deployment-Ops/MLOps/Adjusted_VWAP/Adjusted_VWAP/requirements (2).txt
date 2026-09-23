@@ -1,0 +1,12 @@
+gym==0.26.0
+shimmy>=0.2.1
+statsmodels
+polygon-api-client
+databento
+scipy
+h5py
+arch
+more-itertools
+boto3
+scikit-learn
+tqdm

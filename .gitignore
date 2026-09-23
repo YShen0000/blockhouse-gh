@@ -1,0 +1,19 @@
+# Ignore all CSV files
+*.csv
+
+# Ignore all HDF5 model files
+*.h5
+
+# Ignore other common machine learning model files
+*.joblib
+*.pkl
+*.model
+*.pb
+*.onnx
+
+
+# Large archive - excluded from git (117MB, exceeds GitHub limit)
+Blockhouse-main.zip
+
+# macOS
+.DS_Store

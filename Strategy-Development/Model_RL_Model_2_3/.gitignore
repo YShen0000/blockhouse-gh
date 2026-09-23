@@ -1,0 +1,9 @@
+**/*.pyc
+**/*/_pycache_/*
+**/*.csv
+**/*.pkl
+**/tune_results
+**/*.h5
+**/logs
+**/*.pt
+**/wandb

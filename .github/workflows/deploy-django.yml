@@ -1,0 +1,135 @@
+name: Deploy Django App to EC2
+
+on:
+  push:
+    branches:
+      - staging
+      - main
+      - dev
+    paths:
+      - 'Backend/Django/**'
+      - '.github/workflows/deploy-django.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      BRANCH_PROD: main
+      BRANCH_STAGING: staging
+      BRANCH_DEV: dev
+
+    steps:
+      - name: Add SSH Key (Staging)
+        if: github.ref_name == env.BRANCH_STAGING
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.EC2_STAGING_SSH_KEY }}
+
+      - name: Add SSH Key (Production)
+        if: github.ref_name == env.BRANCH_PROD
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.EC2_PROD_SSH_KEY }}
+
+      - name: Add SSH Key (Development)
+        if: github.ref_name == env.BRANCH_DEV
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.EC2_DEV_SSH_KEY }}
+
+      - name: SSH, Fetch/Pull, and Run Django Commands
+        run: |
+          echo -e "\n---### BRANCH: ${{ github.ref_name }} ###---\n"
+
+          # Determine environment based on the branch and set corresponding variables
+          if [[ "${{ github.ref_name }}" == "${{ env.BRANCH_PROD }}" ]]; then
+            BRANCH_NAME="${{ env.BRANCH_PROD }}"
+            EC2_USER="${{ secrets.EC2_PROD_USER }}"
+            EC2_HOST="${{ secrets.EC2_PROD_HOST }}"
+          elif [[ "${{ github.ref_name }}" == "${{ env.BRANCH_STAGING }}" ]]; then
+            BRANCH_NAME="${{ env.BRANCH_STAGING }}"
+            EC2_USER="${{ secrets.EC2_STAGING_USER }}"
+            EC2_HOST="${{ secrets.EC2_STAGING_HOST }}"
+          elif [[ "${{ github.ref_name }}" == "${{ env.BRANCH_DEV }}" ]]; then
+            BRANCH_NAME="${{ env.BRANCH_DEV }}"
+            EC2_USER="${{ secrets.EC2_DEV_USER }}"
+            EC2_HOST="${{ secrets.EC2_DEV_HOST }}"
+          else
+            echo "Branch not recognized. Exiting."
+            exit 1
+          fi
+
+          echo -e "\n---### Deploying to $EC2_HOST ###---\n"
+
+          # SSH into the EC2 instance and execute deployment commands
+          ssh -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST << EOF
+          set -e  # Exit immediately if any command fails
+
+          cd /home/ubuntu/Blockhouse
+
+          echo -e "\n---### Git - Pulling Latest Changes ###---\n"
+          git checkout "$BRANCH_NAME"
+
+          git fetch origin "$BRANCH_NAME" || { echo "Failed to fetch origin/$BRANCH_NAME"; exit 1; }
+
+          # Reset to the latest changes and avoid merge conflicts
+          git reset --hard "origin/$BRANCH_NAME" || { echo "Git reset to origin/$BRANCH_NAME failed. Checking for conflicts..."; exit 1; }
+
+          echo -e "\n---### Installation & Setup ###---\n"
+          cd Backend/Django
+          
+          echo "1. Activating virtual environment..."
+          source venv/bin/activate || { echo "Failed to activate virtual environment"; exit 1; }
+
+          echo "2. Installing dependencies..."
+          pip install -r requirements.txt || { echo "Pip install failed"; exit 1; }
+
+          echo "3. Running migrations..."
+          python manage.py migrate --no-input || { echo "Migrations failed"; exit 1; }
+
+          echo -e "\n---### Gunicorn ###---\n"
+          # Check if Gunicorn is running
+          if pgrep gunicorn > /dev/null
+          then
+              echo "1. Gunicorn is running. Restarting Gunicorn..."
+              sudo systemctl reload gunicorn || { echo "Gunicorn reload failed"; exit 1; }
+          else
+              echo "1. Gunicorn is not running. Starting Gunicorn..."
+              sudo systemctl start gunicorn || { echo "Gunicorn start failed"; exit 1; }
+          fi
+
+          echo "2. Waiting for Gunicorn to stabilize..."
+
+          MAX_ATTEMPTS=10
+          SLEEP_INTERVAL=5
+          ATTEMPT=1
+
+          while [ \$ATTEMPT -le \$MAX_ATTEMPTS ]; do
+              if systemctl is-active --quiet gunicorn; then
+                  echo "3. Gunicorn is active."
+                  break
+              else
+                  echo "Gunicorn is not active yet. Attempt \$ATTEMPT of \$MAX_ATTEMPTS."
+                  sleep \$SLEEP_INTERVAL
+              fi
+
+              if [ \$ATTEMPT -eq \$MAX_ATTEMPTS ]; then
+                  echo "3. Gunicorn failed to become active after \$MAX_ATTEMPTS attempts."
+                  
+                  # Revert to the previous commit if Gunicorn fails to start
+                  git reset --hard HEAD@{1} || { echo "5. Failed to revert to previous version"; exit 1; }
+                  sudo systemctl restart gunicorn || { echo "5. Gunicorn fallback failed"; exit 1; }
+                  sudo systemctl status gunicorn
+                  echo "6. Reverted to previous version and restarted Gunicorn."
+                  exit 1
+              fi
+
+              ATTEMPT=\$((ATTEMPT + 1))
+          done
+
+          # Prevent non-zero exit for status
+          sudo systemctl status gunicorn || true
+
+          echo "Deployment completed successfully."
+          EOF

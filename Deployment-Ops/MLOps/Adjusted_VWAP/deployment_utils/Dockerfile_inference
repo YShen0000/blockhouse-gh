@@ -1,0 +1,49 @@
+## If running below image then run this command in terminal before to get access 
+# >> aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 763104351884.dkr.ecr.us-east-1.amazonaws.com
+FROM 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-inference:2.1.0-gpu-py310
+
+RUN apt-get update && apt-get install -y wget libgl1-mesa-glx libglib2.0-0
+## Build Essential
+RUN apt-get install -y build-essential
+
+
+# Install Miniconda
+# RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
+# RUN bash miniconda.sh -b -p /opt/conda
+# ENV PATH="/opt/conda/bin:${PATH}"
+
+# Copy and create Conda environment
+# COPY environment.yml /tmp/environment.yml
+# RUN conda env create -f /tmp/environment.yml
+
+RUN conda install -c conda-forge ta-lib
+
+# Activate the Conda environment
+# RUN conda init
+# RUN conda activate sagemaker_env
+# COPY blockhouse_ml /opt/ml/blockhouse_ml
+# COPY requirements.txt /opt/ml/requirements.txt
+# COPY README.md /opt/ml/README.md
+# COPY setup.py /opt/ml/setup.py
+# COPY model.tar.gz /opt/ml/model.tar.gz
+
+# ENV PATH="/opt/conda/envs/sagemaker_env/bin:${PATH}"
+
+# Set up shell to use conda
+# SHELL ["/bin/bash", "-c"]
+# RUN echo "source /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc
+# RUN echo "conda activate sagemaker_env" >> ~/.bashrc
+
+# Copy model file
+# COPY model.tar.gz /opt/ml/model.tar.gz
+
+# RUN git clone https://github.com/aws/sagemaker-pytorch-inference-toolkit.git
+# RUN cd sagemaker-pytorch-inference-toolkit && pip install .
+# RUN pip install sagemaker-pytorch-inference
+# RUN pip install -r /opt/ml/requirements.txt
+
+# Set working directory
+WORKDIR /opt/ml
+
+# Set entrypoint to use bash
+# ENTRYPOINT ["/bin/bash", "-c"]

@@ -1,0 +1,10 @@
+gym==0.26.0
+shimmy>=0.2.1
+stable-baselines3>=2.3.0
+torch
+statsmodels
+h5py
+arch
+databento
+scikit-learn
+statsmodels

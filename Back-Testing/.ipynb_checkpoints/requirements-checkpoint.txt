@@ -1,0 +1,13 @@
+gym==0.26.0
+shimmy>=0.2.1
+stable-baselines3
+torch
+statsmodels
+polygon-api-client
+scipy
+h5py
+arch
+ray[tune]
+pytorch-widedeep
+more-itertools
+databento

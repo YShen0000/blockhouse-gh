@@ -1,0 +1,162 @@
+name: Deploy FastAPI App (Docker) to EC2
+
+on:
+  push:
+    branches:
+      - staging
+      - main
+      - dev
+    paths:
+      - 'Backend/FastAPI/**'
+      - '.github/workflows/deploy-fast-api.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select the environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+          - development
+      branch:
+        description: 'Branch to deploy'
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      BRANCH_PROD: main
+      BRANCH_STAGING: staging
+      BRANCH_DEV: dev
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Ensures that all git history is available
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build Docker Image
+        id: docker_build
+        uses: docker/build-push-action@v4
+        with:
+          context: ./Backend/FastAPI
+          file: ./Backend/FastAPI/Dockerfile
+          push: false  # Set to true if pushing to a registry
+          tags: fastapi-app:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new
+
+      - name: Rename Build Cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      # Add SSH Key based on the deployment environment
+      - name: Add SSH Key (Staging)
+        if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/staging') || 
+               (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging') }}
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.EC2_STAGING_SSH_KEY }}
+
+      - name: Add SSH Key (Production)
+        if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || 
+               (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production') }}
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.EC2_PROD_SSH_KEY }}
+
+      - name: Add SSH Key (Development)
+        if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/dev') || 
+               (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'development') }}
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.EC2_DEV_SSH_KEY }}
+
+      - name: Deploy to EC2
+        env:
+          BRANCH_PROD: main
+          BRANCH_STAGING: staging
+          BRANCH_DEV: dev
+        run: |
+          echo "Determining deployment environment..."
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+            DEPLOY_BRANCH="${{ github.event.inputs.branch }}"
+          else
+            ENVIRONMENT=""
+            case "${GITHUB_REF##*/}" in
+              $BRANCH_PROD)
+                ENVIRONMENT="production"
+                DEPLOY_BRANCH="$BRANCH_PROD"
+                ;;
+              $BRANCH_STAGING)
+                ENVIRONMENT="staging"
+                DEPLOY_BRANCH="$BRANCH_STAGING"
+                ;;
+              $BRANCH_DEV)
+                ENVIRONMENT="development"
+                DEPLOY_BRANCH="$BRANCH_DEV"
+                ;;
+              *)
+                echo "Branch not recognized. Exiting."
+                exit 1
+                ;;
+            esac
+          fi
+
+          if [[ "$ENVIRONMENT" == "production" ]]; then
+            EC2_USER="${{ secrets.EC2_PROD_USER }}"
+            EC2_HOST="${{ secrets.EC2_PROD_HOST }}"
+          elif [[ "$ENVIRONMENT" == "staging" ]]; then
+            EC2_USER="${{ secrets.EC2_STAGING_USER }}"
+            EC2_HOST="${{ secrets.EC2_STAGING_HOST }}"
+          elif [[ "$ENVIRONMENT" == "development" ]]; then
+            EC2_USER="${{ secrets.EC2_DEV_USER }}"
+            EC2_HOST="${{ secrets.EC2_DEV_HOST }}"
+          else
+            echo "Environment not recognized. Exiting."
+            exit 1
+          fi
+
+          echo "Deploying to $EC2_HOST on branch $DEPLOY_BRANCH"
+
+          ssh -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST << EOF
+            set -e  # Exit immediately if any command fails
+
+            echo "Navigating to application directory..."
+            cd /home/ubuntu/Blockhouse/Backend/FastAPI
+
+            echo "Pulling latest changes from Git..."
+            git checkout "$DEPLOY_BRANCH"
+            git pull origin "$DEPLOY_BRANCH"
+
+            echo "Building Docker images..."
+            docker-compose build --no-cache
+
+            echo "Stopping existing containers..."
+            docker-compose down
+
+            echo "Starting containers with Docker Compose..."
+            docker-compose up -d --remove-orphans
+
+            echo "Verifying that containers are running..."
+            docker-compose ps
+
+            echo "Deployment to $EC2_HOST completed successfully."

@@ -1,0 +1,132 @@
+name: Deploy Go App to EC2
+
+on:
+  push:
+    branches:
+      - staging
+      - main
+      - dev
+    paths:
+      - 'Backend/Go/**'
+      - '.github/workflows/deploy-go.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      BRANCH_PROD: main
+      BRANCH_STAGING: staging
+      BRANCH_DEV: dev
+
+    steps:
+      - name: Add SSH Key (Staging)
+        if: github.ref_name == env.BRANCH_STAGING
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.EC2_STAGING_SSH_KEY }}
+
+      - name: Add SSH Key (Production)
+        if: github.ref_name == env.BRANCH_PROD
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.EC2_PROD_SSH_KEY }}
+
+      - name: Add SSH Key (Development)
+        if: github.ref_name == env.BRANCH_DEV
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.EC2_DEV_SSH_KEY }}
+
+      - name: SSH, Fetch/Pull, and Run Go Commands
+        run: |
+          echo -e "\n---### BRANCH: ${{ github.ref_name }} ###---\n"
+
+          # Determine environment based on the branch and set corresponding variables
+          if [[ "${{ github.ref_name }}" == "${{ env.BRANCH_PROD }}" ]]; then
+            BRANCH_NAME="${{ env.BRANCH_PROD }}"
+            EC2_USER="${{ secrets.EC2_PROD_USER }}"
+            EC2_HOST="${{ secrets.EC2_PROD_HOST }}"
+          elif [[ "${{ github.ref_name }}" == "${{ env.BRANCH_STAGING }}" ]]; then
+            BRANCH_NAME="${{ env.BRANCH_STAGING }}"
+            EC2_USER="${{ secrets.EC2_STAGING_USER }}"
+            EC2_HOST="${{ secrets.EC2_STAGING_HOST }}"
+          elif [[ "${{ github.ref_name }}" == "${{ env.BRANCH_DEV }}" ]]; then
+            BRANCH_NAME="${{ env.BRANCH_DEV }}"
+            EC2_USER="${{ secrets.EC2_DEV_USER }}"
+            EC2_HOST="${{ secrets.EC2_DEV_HOST }}"
+          else
+            echo "Branch not recognized. Exiting."
+            exit 1
+          fi
+
+          echo -e "\n---### Deploying to $EC2_HOST ###---\n"
+
+          # SSH into the EC2 instance and execute deployment commands
+          ssh -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST << EOF
+          set -e  # Exit immediately if any command fails
+
+          cd /home/ubuntu/Blockhouse
+
+          echo -e "\n---### Git - Pulling Latest Changes ###---\n"
+          git checkout "$BRANCH_NAME"
+
+          git fetch origin "$BRANCH_NAME" || { echo "Failed to fetch origin/$BRANCH_NAME"; exit 1; }
+
+          # Reset to the latest changes and avoid merge conflicts
+          git reset --hard "origin/$BRANCH_NAME" || { echo "Git reset to origin/$BRANCH_NAME failed. Checking for conflicts..."; exit 1; }
+
+          echo -e "\n---### Installation & Setup ###---\n"
+          cd Backend/Go/transfer-api
+          
+          echo "1. Installing dependencies..."
+          go mod tidy || { echo "Failed to install dependencies"; exit 1; }
+
+          echo "3. Build Go Application..."
+          go build -o transfer-api cmd/main.go || { echo "Go Binary Build failed"; exit 1; }
+
+          echo -e "\n---### go-api service ###---\n"
+          if systemctl is-active --quiet go-api
+          then
+              echo "1. go-api service is running. Reloading go-api service..."
+              sudo systemctl daemon-reload || { echo "Daemon reload failed"; exit 1; }
+              sudo systemctl reload go-api || { echo "Go-api reload failed"; exit 1; }
+          else
+              echo "1. Go-API is not running. Starting Go-API..."
+              sudo systemctl start go-api || { echo "Go-API start failed"; exit 1; }
+          fi
+
+          echo "2. Waiting for Go-API to stabilize..."
+
+          MAX_ATTEMPTS=10
+          SLEEP_INTERVAL=5
+          ATTEMPT=1
+
+          while [ \$ATTEMPT -le \$MAX_ATTEMPTS ]; do
+              if systemctl is-active --quiet go-api; then
+                  echo "3. go-api is active."
+                  break
+              else
+                  echo "go-api is not active yet. Attempt \$ATTEMPT of \$MAX_ATTEMPTS."
+                  sleep \$SLEEP_INTERVAL
+              fi
+
+              if [ \$ATTEMPT -eq \$MAX_ATTEMPTS ]; then
+                  echo "3. go-api service failed to become active after \$MAX_ATTEMPTS attempts."
+                  
+                  # Revert to the previous commit if go-api service fails to start
+                  git reset --hard HEAD@{1} || { echo "5. Failed to revert to previous version"; exit 1; }
+                  sudo systemctl restart go-api || { echo "5. go-api service fallback failed"; exit 1; }
+                  sudo systemctl status go-api
+                  echo "6. Reverted to previous version and restarted go-api."
+                  exit 1
+              fi
+
+              ATTEMPT=\$((ATTEMPT + 1))
+          done
+
+          # Prevent non-zero exit for status
+          sudo systemctl status go-api || true
+
+          echo "Deployment completed successfully."
+          EOF

@@ -1,0 +1,371 @@
+####################################################################################################################################
+
+####################################################################################################################################
+name: Deploy Strategy Code
+
+'on':
+  push:
+    branches:
+      - main
+    paths:
+    - Strategy-Development/Main_Package/**
+
+
+  pull_request:
+    branches:
+      - main
+    paths:
+    - Strategy-Development/Main_Package/**
+
+  schedule:
+    - cron: '0 9 * * 1'  # Run every Monday at 09:00 UTC
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.10'
+
+      - name: Install boto3
+        run: |
+          echo "Installing boto3..."
+          python -m pip install --upgrade pip
+          pip install boto3
+          echo "boto3 installed successfully."
+
+      - name: Deploy model packages and endpoints
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SAGEMAKER_ROLE_ARN: ${{ secrets.AWS_SAGEMAKER_ROLE_ARN }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+
+          # Navigate to the correct directory containing the model folders
+          # cd Deployment-Ops/Test_folder/Model-Stat-Model-4
+          cd Strategy-Development/Main_Package
+
+
+          # Define the folders to process
+          FOLDERS=("BL-report" "HW-report" "website")
+
+          # Shared requirements.txt location
+          REQUIREMENTS_FILE="requirements.txt"
+
+          for folder in "${FOLDERS[@]}"; do
+            BASE_PACKAGE_NAME="${folder}"
+            PACKAGE_NAME="MainPackage-${BASE_PACKAGE_NAME}"
+            VERSION=1
+            MODEL_NAME="${PACKAGE_NAME}-v${VERSION}-model"
+            ENDPOINT_CONFIG_NAME="${PACKAGE_NAME}-v${VERSION}-endpoint-config"
+            ENDPOINT_NAME="${PACKAGE_NAME}-endpoint"
+            
+            echo "-------------------------"
+            echo "Processing package: ${BASE_PACKAGE_NAME}"
+            echo "Listing contents of ${BASE_PACKAGE_NAME}:"
+            ls -la "${BASE_PACKAGE_NAME}"
+            
+            # Increment version if a model with this name already exists
+            echo "Checking for existing model versions..."
+            while aws sagemaker describe-model --model-name "${MODEL_NAME}" > /dev/null 2>&1; do
+              VERSION=$((VERSION + 1))
+              MODEL_NAME="${PACKAGE_NAME}-v${VERSION}-model"
+              ENDPOINT_CONFIG_NAME="${PACKAGE_NAME}-v${VERSION}-endpoint-config"
+              echo "Incremented to version ${VERSION} for model ${MODEL_NAME}"
+            done
+            
+            echo "Deploying version ${VERSION} of package: ${BASE_PACKAGE_NAME}"
+            
+            # Check if required files exist
+            if [ ! -f "${BASE_PACKAGE_NAME}/inference.py" ]; then
+              echo "Error: inference.py not found in ${BASE_PACKAGE_NAME}"
+              exit 1
+            fi
+            if [ ! -f "${REQUIREMENTS_FILE}" ]; then
+              echo "Error: requirements.txt not found in the shared location."
+              exit 1
+            fi
+            
+            # Create a temporary directory for packaging
+            TEMP_DIR=$(mktemp -d)
+            mkdir -p "${TEMP_DIR}/code"
+            
+            # Copy all contents to the temporary directory
+            cp -R "${BASE_PACKAGE_NAME}"/* "${TEMP_DIR}/code/"
+            # cp "${""REQUIREMENTS_FILE}" "${TEMP_DIR}/code/"
+            cp -R ./* "${TEMP_DIR}/code/"
+            # cp _R {}
+
+            # Package the model directory and necessary files
+            echo "Packaging model directory and specific files..."
+            tar -czvf "${PACKAGE_NAME}-v${VERSION}.tar.gz" -C "${TEMP_DIR}" code
+            
+            # Check if packaging succeeded
+            if [ $? -ne 0 ]; then
+              echo "Error in packaging ${PACKAGE_NAME}-v${VERSION}.tar.gz. Exiting."
+              exit 1
+            fi
+            echo "Packaging completed for ${PACKAGE_NAME}-v${VERSION}.tar.gz"
+            echo "Listing contents of the current directory after packaging:"
+            ls -la
+            
+            # Clean up temporary directory
+            rm -rf "${TEMP_DIR}"
+            
+            # Upload package to S3
+            echo "Uploading ${PACKAGE_NAME}-v${VERSION}.tar.gz to S3 bucket s3://sagemaker-tradingmodel-us-east-1/${PACKAGE_NAME}/..."
+            aws s3 cp "${PACKAGE_NAME}-v${VERSION}.tar.gz" "s3://sagemaker-tradingmodel-us-east-1/${PACKAGE_NAME}/${PACKAGE_NAME}-v${VERSION}.tar.gz" --debug
+            
+            # Set container image and environment configuration
+            IMAGE_URI="433046797920.dkr.ecr.us-east-1.amazonaws.com/blockhouse-ml:deploy-test3"
+            S3_URI="s3://sagemaker-tradingmodel-us-east-1/${PACKAGE_NAME}/${PACKAGE_NAME}-v${VERSION}.tar.gz"
+            
+            # Create SageMaker Model
+            echo "Creating SageMaker model ${MODEL_NAME} with data at ${S3_URI}..."
+            aws sagemaker create-model \
+              --model-name "$MODEL_NAME" \
+              --primary-container "{\
+                \"Image\": \"${IMAGE_URI}\",\
+                \"ModelDataUrl\": \"${S3_URI}\",\
+                \"Environment\": {\
+                  \"SAGEMAKER_PROGRAM\": \"inference.py\"\
+                }\
+              }" \
+              --execution-role-arn "${AWS_SAGEMAKER_ROLE_ARN}"
+            
+            # Define endpoint configurations
+            if [ "${BASE_PACKAGE_NAME}" == "HW-report" ]; then
+              # Asynchronous Inference Configuration for HW-report
+              INSTANCE_TYPE="ml.m5.large"
+              INPUT_S3="s3://sagemaker-tradingmodel-us-east-1/csv_dump/corrected_dates_output_just_2.csv"
+              OUTPUT_S3="s3://sagemaker-tradingmodel-us-east-1/predictions/"
+
+                           echo "Creating async endpoint configuration ${ENDPOINT_CONFIG_NAME} for model ${MODEL_NAME}..."
+              aws sagemaker create-endpoint-config \
+                --endpoint-config-name "$ENDPOINT_CONFIG_NAME" \
+                --production-variants VariantName=AllTraffic,ModelName="$MODEL_NAME",InitialInstanceCount=1,InstanceType="$INSTANCE_TYPE" \
+                --async-inference-config "{\
+                  \"OutputConfig\": {\
+                    \"S3OutputPath\": \"${OUTPUT_S3}\"\
+                  }\
+                }"
+
+            else
+              # Real-Time Inference Configuration for BL-report and website
+              INSTANCE_TYPE="ml.g4dn.2xlarge"
+              echo "Creating real-time endpoint configuration ${ENDPOINT_CONFIG_NAME} for model ${MODEL_NAME}..."
+              aws sagemaker create-endpoint-config \
+                --endpoint-config-name "$ENDPOINT_CONFIG_NAME" \
+                --production-variants VariantName=AllTraffic,ModelName="$MODEL_NAME",InitialInstanceCount=1,InstanceType="$INSTANCE_TYPE"
+            fi
+            
+            # Update or Create Endpoint
+            echo "Checking if endpoint ${ENDPOINT_NAME} already exists to update..."
+            if aws sagemaker describe-endpoint --endpoint-name "${ENDPOINT_NAME}" > /dev/null 2>&1; then
+              echo "Endpoint ${ENDPOINT_NAME} already exists. Updating endpoint..."
+              aws sagemaker update-endpoint \
+                --endpoint-name "$ENDPOINT_NAME" \
+                --endpoint-config-name "$ENDPOINT_CONFIG_NAME"
+            else
+              echo "Creating new endpoint ${ENDPOINT_NAME}..."
+              aws sagemaker create-endpoint \
+                --endpoint-name "$ENDPOINT_NAME" \
+                --endpoint-config-name "$ENDPOINT_CONFIG_NAME"
+            fi
+            
+            # Clean up the tar file to avoid clutter
+            echo "Cleaning up local file ${PACKAGE_NAME}-v${VERSION}.tar.gz..."
+            rm "${PACKAGE_NAME}-v${VERSION}.tar.gz"
+            echo "Deployment of ${BASE_PACKAGE_NAME} version ${VERSION} completed."
+          done
+
+
+          
+
+
+        # echo "All packages processed successfully."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#####################################################################################################################################
+
+#####################################################################################################################################
+
+# name: Deploy Strategy Code
+
+# 'on':
+#   push:
+#     branches:
+#       - Prasanna/Dev-45/Github-Sagemaker-Integration
+
+# jobs:
+#   deploy:
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 60 # Optional timeout adjustment
+
+#     steps:
+#       - name: Check out the code
+#         uses: actions/checkout@v2
+
+#       - name: Set up Python
+#         uses: actions/setup-python@v2
+#         with:
+#           python-version: '3.10'
+
+#       - name: Install boto3
+#         run: |
+#           echo "Installing boto3..."
+#           python -m pip install --upgrade pip
+#           pip install boto3
+#           echo "boto3 installed successfully."
+          
+#       - name: Extract and deploy each model package with versioning
+#         env:
+#           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#           AWS_SAGEMAKER_ROLE_ARN: ${{ secrets.AWS_SAGEMAKER_ROLE_ARN }}
+#           AWS_DEFAULT_REGION: us-east-1 # Explicitly set the region to avoid IMDS lookup
+#         run: |
+#           set -e  # Exit immediately if a command exits with a non-zero status
+#           echo "Navigating to Deployment-Ops/Test_folder directory..."
+#           cd Deployment-Ops/Test_folder
+#           echo "Current working directory: $(pwd)"
+#           echo "Listing contents of the Test_folder directory:"
+#           ls -la
+          
+#           # Loop through each model package folder
+#           for folder in */ ; do
+#             BASE_PACKAGE_NAME="${folder%/}"
+#             PACKAGE_NAME="${BASE_PACKAGE_NAME}"
+#             VERSION=1
+#             MODEL_NAME="${PACKAGE_NAME}-v${VERSION}-model"
+#             ENDPOINT_CONFIG_NAME="${PACKAGE_NAME}-v${VERSION}-endpoint-config"
+#             ENDPOINT_NAME="${PACKAGE_NAME}-endpoint"
+            
+#             echo "-------------------------"
+#             echo "Processing package: ${BASE_PACKAGE_NAME}"
+#             echo "Listing contents of ${BASE_PACKAGE_NAME}:"
+#             ls -la "${BASE_PACKAGE_NAME}"
+            
+#             # Increment version if a model with this name already exists
+#             echo "Checking for existing model versions..."
+#             while aws sagemaker describe-model --model-name "${MODEL_NAME}" > /dev/null 2>&1; do
+#               VERSION=$((VERSION + 1))
+#               MODEL_NAME="${PACKAGE_NAME}-v${VERSION}-model"
+#               ENDPOINT_CONFIG_NAME="${PACKAGE_NAME}-v${VERSION}-endpoint-config"
+#               echo "Incremented to version ${VERSION} for model ${MODEL_NAME}"
+#             done
+            
+#             echo "Deploying version ${VERSION} of package: ${BASE_PACKAGE_NAME}"
+            
+#             # Debug information
+#             echo "Current directory: $(pwd)"
+#             echo "Base package directory: $BASE_PACKAGE_NAME"
+#             echo "Recursive listing of ${BASE_PACKAGE_NAME}:"
+#             ls -R "${BASE_PACKAGE_NAME}"
+            
+#             # Check if required files exist
+#             if [ ! -f "${BASE_PACKAGE_NAME}/inference.py" ]; then
+#               echo "Error: inference.py not found in ${BASE_PACKAGE_NAME}"
+#               exit 1
+#             fi
+#             if [ ! -f "${BASE_PACKAGE_NAME}/requirements.txt" ]; then
+#               echo "Error: requirements.txt not found in ${BASE_PACKAGE_NAME}"
+#               exit 1
+#             fi
+            
+#             # Create a temporary directory for packaging
+#             TEMP_DIR=$(mktemp -d)
+#             mkdir -p "${TEMP_DIR}/code"
+            
+#             # Copy all contents to the temporary directory
+#             cp -R "${BASE_PACKAGE_NAME}"/* "${TEMP_DIR}/code/"
+            
+#             # Package the model directory and necessary files
+#             echo "Packaging model directory and specific files..."
+#             tar -czvf "${PACKAGE_NAME}-v${VERSION}.tar.gz" -C "${TEMP_DIR}" code
+            
+#             # Check if packaging succeeded
+#             if [ $? -ne 0 ]; then
+#               echo "Error in packaging ${PACKAGE_NAME}-v${VERSION}.tar.gz. Exiting."
+#               exit 1
+#             fi
+#             echo "Packaging completed for ${PACKAGE_NAME}-v${VERSION}.tar.gz"
+#             echo "Listing contents of the current directory after packaging:"
+#             ls -la
+            
+#             # Clean up temporary directory
+#             rm -rf "${TEMP_DIR}"
+            
+#             # Upload package to S3
+#             echo "Uploading ${PACKAGE_NAME}-v${VERSION}.tar.gz to S3 bucket s3://sagemaker-tradingmodel-us-east-1/${PACKAGE_NAME}/..."
+#             aws s3 cp "${PACKAGE_NAME}-v${VERSION}.tar.gz" "s3://sagemaker-tradingmodel-us-east-1/${PACKAGE_NAME}/${PACKAGE_NAME}-v${VERSION}.tar.gz" --debug
+            
+#             # Create SageMaker Model
+#             echo "Creating SageMaker model ${MODEL_NAME} with data at s3://sagemaker-tradingmodel-us-east-1/${PACKAGE_NAME}/${PACKAGE_NAME}-v${VERSION}.tar.gz..."
+#             aws sagemaker create-model \
+#               --model-name "$MODEL_NAME" \
+#               --primary-container '{
+#                 "Image": "433046797920.dkr.ecr.us-east-1.amazonaws.com/blockhouse-ml:deploy-test3",
+#                 "ModelDataUrl": "s3://sagemaker-tradingmodel-us-east-1/'${PACKAGE_NAME}'/'${PACKAGE_NAME}'-v'${VERSION}'.tar.gz",
+#                 "Environment": {
+#                   "SAGEMAKER_PROGRAM": "inference.py"
+#                 }
+#               }' \
+#               --execution-role-arn "${AWS_SAGEMAKER_ROLE_ARN}"
+            
+#             # Create Endpoint Configuration
+#             echo "Creating endpoint configuration ${ENDPOINT_CONFIG_NAME} for model ${MODEL_NAME}..."
+#             aws sagemaker create-endpoint-config \
+#               --endpoint-config-name "$ENDPOINT_CONFIG_NAME" \
+#               --production-variants VariantName=AllTraffic,ModelName="$MODEL_NAME",InitialInstanceCount=1,InstanceType=ml.g4dn.2xlarge
+            
+#             # Update or Create Endpoint
+#             echo "Checking if endpoint ${ENDPOINT_NAME} already exists to update or create..."
+#             if aws sagemaker describe-endpoint --endpoint-name "${ENDPOINT_NAME}" > /dev/null 2>&1; then
+#               echo "Endpoint ${ENDPOINT_NAME} already exists. Updating endpoint..."
+#               aws sagemaker update-endpoint \
+#                 --endpoint-name "$ENDPOINT_NAME" \
+#                 --endpoint-config-name "$ENDPOINT_CONFIG_NAME"
+#             else
+#               echo "Creating new endpoint ${ENDPOINT_NAME}..."
+#               aws sagemaker create-endpoint \
+#                 --endpoint-name "$ENDPOINT_NAME" \
+#                 --endpoint-config-name "$ENDPOINT_CONFIG_NAME"
+#             fi
+            
+#             # Clean up the tar file to avoid clutter on the runner
+#             echo "Cleaning up local file ${PACKAGE_NAME}-v${VERSION}.tar.gz..."
+#             rm "${PACKAGE_NAME}-v${VERSION}.tar.gz"
+#             echo "Deployment of ${BASE_PACKAGE_NAME} version ${VERSION} completed."
+#           done
+          
+#           echo "All packages processed successfully."
+
+
+
+
+
+

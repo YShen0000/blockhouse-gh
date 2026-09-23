@@ -1,0 +1,9 @@
+**/*.pyc
+**/*/_pycache_/*
+**/*.csv
+**/Models/*
+**/Data/*
+**/MicroModels/*
+**/TabModels/*
+**/blockhouse_ml.egg-info
+**/*.png

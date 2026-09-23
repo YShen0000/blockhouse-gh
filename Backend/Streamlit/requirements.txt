@@ -1,0 +1,15 @@
+numpy
+pandas
+streamlit
+yfinance
+scipy
+matplotlib
+streamlit-extras
+Django
+ipython
+ipywidgets
+reportlab
+seaborn
+mplfinance
+kaleido==0.1.0; platform_system == "Linux"
+kaleido==0.1.0post1; platform_system == "Windows"

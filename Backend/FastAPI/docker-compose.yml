@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    restart: always
+    environment:
+      MONGODB_URL: ${MONGODB_URL}
+      MONGODB_DB_NAME: ${MONGODB_DB_NAME}
+      
+      POLYGON_API_KEY: ${POLYGON_API_KEY}
+
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_STORAGE_BUCKET: ${AWS_STORAGE_BUCKET}
+      AWS_REGION: ${AWS_REGION}
+      
+      DD_API_KEY: "d07875efeb69d104201f9c9beb09d752"
+      DD_LOGGING_ENV: "development"
+      DD_SERVICE: "fastapi-app"
+      DD_HOSTNAME: "localhost"
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
