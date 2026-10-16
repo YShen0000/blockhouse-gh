@@ -52,4 +52,5 @@ jobs:
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         files: ./Backend/FastAPI/coverage.xml
-        fail_ci_if_error: true 
+        # Coverage upload is reporting only; without a CODECOV_TOKEN it must not fail the tests.
+        fail_ci_if_error: false 

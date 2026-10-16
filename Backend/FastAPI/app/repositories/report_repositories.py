@@ -85,6 +85,26 @@ def save_report_to_s3(user_email: str, institution_id: str, report_pdf: bytes) -
     return s3_url
 
 
+def save_file_report_to_s3(file_id: str, report_pdf: bytes) -> str:
+    """Store the PDF report of an uploaded file and return its URL."""
+    filepath = f"hoodwinked/report_pdf/files/{file_id}.pdf"
+    s3.upload(filepath, report_pdf, content_type="application/pdf")
+    return s3.get_url(filepath)
+
+
+async def db_get_report_link(file_id: str) -> Optional[str]:
+    """Return the saved report link of an uploaded file, or None."""
+    report = await db.get_collection("Report").find_one({"file_id": file_id}, {"_id": 0})
+    return report.get("report_link") if report else None
+
+
+async def db_save_report_link(file_id: str, report_link: str):
+    """Save or update the report link of an uploaded file."""
+    await db.get_collection("Report").update_one(
+        {"file_id": file_id}, {"$set": {"report_link": report_link}}, upsert=True,
+    )
+
+
 async def db_save_report(
     user_email: str,
     institution_id: str,

@@ -29,12 +29,19 @@ class S3:
         self.secret_access_key = secret_access_key
         self.region = region
         self.bucket = bucket
-        self.s3 = boto3.client(
-            "s3",
-            aws_access_key_id=self.access_key_id,
-            aws_secret_access_key=self.secret_access_key,
-            region_name=self.region,
-        )
+        self._client = None
+
+    @property
+    def s3(self):
+        """The boto3 client, created on first use so importing the app needs no AWS config."""
+        if self._client is None:
+            self._client = boto3.client(
+                "s3",
+                aws_access_key_id=self.access_key_id,
+                aws_secret_access_key=self.secret_access_key,
+                region_name=self.region,
+            )
+        return self._client
 
     def upload(self, filepath, data, content_type="octet-stream"):
         """

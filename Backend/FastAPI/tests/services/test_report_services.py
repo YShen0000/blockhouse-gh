@@ -415,7 +415,7 @@ async def test_generate_pdf_new_report_success():
         patch.object(report_repositories, 'fetch_file_from_s3', return_value=mock_df),
         patch.object(report_calculation, 'main', return_value={'some': 'calculation_data'}),
         patch.object(testreports, 'generate_report', return_value=base64.b64encode(b'mock pdf content').decode()),
-        patch.object(report_repositories, 'save_report_to_s3', return_value='https://s3.com/report.pdf'),
+        patch.object(report_repositories, 'save_file_report_to_s3', return_value='https://s3.com/report.pdf'),
         patch.object(report_repositories, 'db_save_report_link', return_value=None)  # Add this to bypass final db save
     ):
         result = await generate_pdf(
@@ -507,7 +507,7 @@ async def test_generate_pdf_s3_save_error():
         patch.object(report_repositories, 'fetch_file_from_s3', return_value=mock_df),
         patch.object(report_calculation, 'main', return_value={'some': 'calculation_data'}),
         patch.object(testreports, 'generate_report', return_value=base64.b64encode(b'mock pdf content').decode()),
-        patch.object(report_repositories, 'save_report_to_s3', side_effect=Exception("S3 save error"))
+        patch.object(report_repositories, 'save_file_report_to_s3', side_effect=Exception("S3 save error"))
     ):
         with pytest.raises(HTTPException) as exc_info:
             await generate_pdf(
