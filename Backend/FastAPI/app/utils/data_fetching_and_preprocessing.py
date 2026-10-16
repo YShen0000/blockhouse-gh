@@ -15,13 +15,20 @@ import json
 
 from ..config.settings import settings
 
-# Calculate HWOE price - Using actual model
-sagemaker_runtime = boto3.client(
-    "sagemaker-runtime",
-    region_name=settings.AWS_REGION,
-    aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-)
+_sagemaker_runtime = None
+
+
+def _sagemaker():
+    """The SageMaker runtime client, created on first use so importing needs no AWS config."""
+    global _sagemaker_runtime
+    if _sagemaker_runtime is None:
+        _sagemaker_runtime = boto3.client(
+            "sagemaker-runtime",
+            region_name=settings.AWS_REGION,
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        )
+    return _sagemaker_runtime
 
 
 def preprocess_by_platform(trade_blotter, platform_type):
@@ -177,7 +184,7 @@ def preprocess_data(trade_blotter, data_dict):
                     request_body = json.dumps(payload)
 
                     try:
-                        response = sagemaker_runtime.invoke_endpoint(
+                        response = _sagemaker().invoke_endpoint(
                             EndpointName="endpoint-real-time-inference24-HW-R",
                             Body=request_body,
                             ContentType="application/json",
@@ -443,7 +450,7 @@ def preprocess_data_merged(trade_blotter):
             request_body = json.dumps(payload)
 
             try:
-                response = sagemaker_runtime.invoke_endpoint(
+                response = _sagemaker().invoke_endpoint(
                     EndpointName="endpoint-real-time-inference24-HW-R",
                     Body=request_body,
                     ContentType="application/json",

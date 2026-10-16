@@ -321,7 +321,9 @@ async def generate_pdf(
         # Save the PDF report to S3 bucket
         try:
             logger.info("Saving PDF report to S3 bucket...")
-            s3_url = report_repositories.save_report_to_s3(file_id, document_base64)
+            s3_url = report_repositories.save_file_report_to_s3(
+                file_id, base64.b64decode(document_base64)
+            )
             logger.info(f"PDF report saved to S3 successfully: {s3_url}")
         except Exception as e:
             logger.error(f"Error saving PDF report to S3: {str(e)}", exc_info=True)

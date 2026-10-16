@@ -21,7 +21,7 @@ def mock_dataframe():
     })
 
 @pytest.fixture(autouse=True)
-async def mock_db_operations():
+def mock_db_operations():
     """Fixture to automatically mock all database operations"""
     # Add your database mocking logic here
     yield
